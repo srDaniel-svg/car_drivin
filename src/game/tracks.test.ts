@@ -15,8 +15,8 @@ function curvature(center: (d: number) => number, d: number): number {
 }
 
 describe('tracks', () => {
-  it('offers four circuits besides the free road', () => {
-    expect(circuits).toHaveLength(4);
+  it('offers seven circuits besides the free road', () => {
+    expect(circuits).toHaveLength(7);
     expect(TRACKS.find((track) => track.id === 'free')?.length).toBeNull();
   });
 

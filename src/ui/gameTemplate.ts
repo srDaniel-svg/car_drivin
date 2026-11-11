@@ -169,6 +169,7 @@ export function createGameTemplate(): string {
             <label><span id="driver-car-label">YOUR CAR</span><select id="driver-car" aria-label="Choose your car model">${carOptions}</select></label>
             <label class="second-driver-option is-hidden"><span>PLAYER 2 CAR</span><select id="second-driver-car" aria-label="Choose player two's car model">${carOptions}</select></label>
             <label><span>TRAFFIC CARS</span><select id="traffic-count" aria-label="Choose number of traffic cars">${trafficOptions}</select></label>
+            <label title="Every so often a wave of slow traffic floods the road and cars start changing lanes."><span>RUSH HOUR</span><select id="rush-hour" aria-label="Choose whether waves of extra traffic appear"><option value="on" selected>WAVES ON</option><option value="off">OFF</option></select></label>
             <label><span>CAR VARIETY</span><select id="car-model-count" aria-label="Choose number of different car models">${varietyOptions}</select></label>
             <label class="condition-option"><span>TIME OF DAY</span><select id="time-of-day" aria-label="Choose the time of day">${timeOfDayOptions}</select></label>
             <label class="condition-option"><span>WEATHER</span><select id="weather" aria-label="Choose the weather">${weatherOptions}</select></label>

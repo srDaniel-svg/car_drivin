@@ -70,6 +70,12 @@ interface TrafficCar {
   /** Collision envelope of the car's model, in world units. */
   length: number;
   width: number;
+  /** Where in its lane the car settles; `laneOffset` eases back here after a lane change. */
+  restOffset: number;
+  /** Seconds until the car may next change lanes (only during rush hour). */
+  laneChangeTimer: number;
+  /** One of the extra cars a rush-hour wave brings; it leaves once the wave is over. */
+  rush: boolean;
 }
 
 interface Viewport {
@@ -151,6 +157,20 @@ const TRAFFIC_SPAWN_AHEAD = 260;
 const TRAFFIC_BRAKE_LIGHT_DECELERATION = 2;
 /** The view must turn this far past side-on before traffic treats it as the new way ahead. */
 const FACING_HYSTERESIS = 0.2;
+/** Extra cars a rush-hour wave puts on the road, on top of the chosen traffic. */
+const RUSH_EXTRA_CARS = 8;
+/** Seconds of driving before the first wave, and between the end of one and the next. */
+const RUSH_FIRST_WAVE_SECONDS = 25;
+const RUSH_INTERVAL_SECONDS = [35, 60] as const;
+/** How long a wave lasts, and how long before it the HUD warns of it. */
+const RUSH_DURATION_SECONDS = 24;
+const RUSH_WARNING_SECONDS = 4;
+/** Wave cars appear just beyond the drawn road, so they come into view rather than pop in. */
+const RUSH_SPAWN_AHEAD = 470;
+/** Lanes must be clear this far either side before traffic moves into them. */
+const LANE_CHANGE_CLEARANCE = 26;
+/** Traffic never cuts in this close to a driver. */
+const LANE_CHANGE_DRIVER_CLEARANCE = 28;
 /** A race starts after a 3-2-1 countdown with every car held on the line. */
 export const RACE_COUNTDOWN_SECONDS = 3;
 /** Once the first car takes the flag, the others have this long to finish. */
@@ -220,6 +240,14 @@ export class DrivingGame {
   private countdown = Number.NEGATIVE_INFINITY;
   /** Seconds the others have left to finish once someone has won; null until then. */
   private finishGrace: number | null = null;
+  /** Rush hour: waves of extra, slower traffic that also changes lanes. */
+  private rushHourEnabled = true;
+  private rushActive = false;
+  /** Seconds until the next wave starts, or until the current one ends. */
+  private rushClock = RUSH_FIRST_WAVE_SECONDS;
+  private rushWarned = false;
+  /** Wave cars not on the road right now. */
+  private readonly rushReserve: TrafficCar[] = [];
 
   constructor(
     private readonly container: HTMLElement,
@@ -359,6 +387,8 @@ export class DrivingGame {
     this.raceTime = 0;
     this.countdown = Number.NEGATIVE_INFINITY;
     this.finishGrace = null;
+    this.endRushHour(true);
+    this.rushClock = RUSH_FIRST_WAVE_SECONDS;
     let ongoingCursor = 45;
     let incomingCursor = 62;
     this.traffic.forEach((car, index) => {
@@ -387,6 +417,12 @@ export class DrivingGame {
     setActiveTrack(id);
     this.reset();
     this.lastIdleRender = 0;
+  }
+
+  /** Turns the rush-hour waves on or off; taken up from the next run. */
+  setRushHour(enabled: boolean): void {
+    this.rushHourEnabled = enabled;
+    if (!enabled) this.endRushHour(true);
   }
 
   getPhase(): GamePhase {
@@ -606,20 +642,7 @@ export class DrivingGame {
     let incomingSpawnCursor = 62;
     for (let index = 0; index < GAME.trafficCount; index += 1) {
       const direction: 1 | -1 = index === 0 ? 1 : index === 1 ? -1 : Math.random() < 0.56 ? 1 : -1;
-      const car: TrafficCar = {
-        mesh: new THREE.Group(),
-        distance: 0,
-        lane: 0,
-        laneOffset: 0,
-        speed: 0,
-        targetSpeed: 0,
-        speedChangeTimer: 0,
-        direction,
-        owner: index % this.drivers.length,
-        counted: this.drivers.map(() => false),
-        length: GAME.collisionLength,
-        width: GAME.collisionWidth,
-      };
+      const car = this.createTrafficCar(direction, index % this.drivers.length, false);
       if (direction === 1) {
         ongoingSpawnCursor += 34 + Math.random() * 48;
         this.spawnTraffic(car, ongoingSpawnCursor);
@@ -630,6 +653,138 @@ export class DrivingGame {
       this.traffic.push(car);
       this.scene.add(car.mesh);
     }
+  }
+
+  private createTrafficCar(direction: 1 | -1, owner: number, rush: boolean): TrafficCar {
+    return {
+      mesh: new THREE.Group(),
+      distance: 0,
+      lane: 0,
+      laneOffset: 0,
+      speed: 0,
+      targetSpeed: 0,
+      speedChangeTimer: 0,
+      direction,
+      owner,
+      counted: this.drivers.map(() => false),
+      length: GAME.collisionLength,
+      width: GAME.collisionWidth,
+      restOffset: 0,
+      laneChangeTimer: 0,
+      rush,
+    };
+  }
+
+  /** Counts down to the next wave, warns of it, and starts and ends it. */
+  private updateRushHour(dt: number): void {
+    if (!this.rushHourEnabled || this.rushReserve.length + this.rushCarsOnRoad() === 0) return;
+    this.rushClock -= dt;
+    if (!this.rushActive) {
+      if (!this.rushWarned && this.rushClock <= RUSH_WARNING_SECONDS) {
+        this.rushWarned = true;
+        for (const driver of this.drivers) this.showNotice(driver, 'RUSH HOUR AHEAD!', 3);
+      }
+      if (this.rushClock <= 0) this.startRushHour();
+    } else if (this.rushClock <= 0) {
+      this.endRushHour(false);
+      for (const driver of this.drivers) this.showNotice(driver, 'TRAFFIC CLEARING', 2.5);
+    }
+  }
+
+  private rushCarsOnRoad(): number {
+    return this.traffic.filter((car) => car.rush).length;
+  }
+
+  /** Brings the wave cars on just past the drawn road, mostly going the drivers' way. */
+  private startRushHour(): void {
+    this.rushActive = true;
+    this.rushClock = RUSH_DURATION_SECONDS;
+    const live = this.drivers.filter((driver) => !driver.crashed);
+    if (live.length === 0) return;
+    this.rushReserve.splice(0).forEach((car, index) => {
+      const owner = live[index % live.length];
+      car.owner = owner.index;
+      car.direction = index % 4 === 3 ? (-owner.facing as 1 | -1) : owner.facing;
+      let ahead = RUSH_SPAWN_AHEAD + Math.floor(index / live.length) * 55 + Math.random() * 30;
+      this.spawnTraffic(car, ahead);
+      // Take whichever of its two lanes is free there, moving further out if both are taken.
+      const firstLane = car.direction === 1 ? 0 : 2;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const lane = [firstLane, firstLane + 1].find((candidate) =>
+          this.laneClear(car, candidate, car.distance),
+        );
+        if (lane !== undefined) {
+          car.lane = lane;
+          break;
+        }
+        ahead += 40;
+        car.distance = owner.distance + owner.facing * ahead;
+      }
+      // Rush-hour traffic crawls along, so it bunches up and blocks lanes.
+      car.speed = car.targetSpeed = this.rushSpeed(car);
+      this.traffic.push(car);
+      this.scene.add(car.mesh);
+    });
+  }
+
+  /**
+   * Ends the wave. Its cars leave the road once they fall behind the drivers,
+   * or straight away when `immediately` (a reset, or rush hour turned off).
+   */
+  private endRushHour(immediately: boolean): void {
+    this.rushActive = false;
+    this.rushWarned = false;
+    this.rushClock =
+      RUSH_INTERVAL_SECONDS[0] + Math.random() * (RUSH_INTERVAL_SECONDS[1] - RUSH_INTERVAL_SECONDS[0]);
+    if (!immediately) return;
+    for (const car of this.traffic.filter((other) => other.rush)) this.retireRushCar(car);
+  }
+
+  private retireRushCar(car: TrafficCar): void {
+    const index = this.traffic.indexOf(car);
+    if (index >= 0) this.traffic.splice(index, 1);
+    this.scene.remove(car.mesh);
+    this.rushReserve.push(car);
+  }
+
+  /** Wave cars crawl at 45–75 km/h with the drivers, 60–90 km/h oncoming. */
+  private rushSpeed(car: TrafficCar): number {
+    return car.direction === this.ownerOf(car).facing
+      ? fromKph(45 + Math.random() * 30)
+      : fromKph(60 + Math.random() * 30);
+  }
+
+  /** No other traffic within reach of `distance` in `lane`. */
+  private laneClear(car: TrafficCar, lane: number, distance: number): boolean {
+    return this.traffic.every(
+      (other) =>
+        other === car ||
+        other.lane !== lane ||
+        Math.abs(other.distance - distance) > LANE_CHANGE_CLEARANCE,
+    );
+  }
+
+  /**
+   * During rush hour traffic switches to the other lane on its side of the
+   * road now and then, when that lane is clear and no driver is right there.
+   * The car keeps its position and eases across over a couple of seconds.
+   */
+  private maybeChangeLane(car: TrafficCar, dt: number): void {
+    car.laneOffset = damp(car.laneOffset, car.restOffset, 1.1, dt);
+    car.laneChangeTimer -= dt;
+    if (!this.rushActive || car.laneChangeTimer > 0) return;
+    car.laneChangeTimer = 4 + Math.random() * 6;
+    if (Math.abs(car.laneOffset - car.restOffset) > 0.5) return;
+    const target = car.lane < 2 ? 1 - car.lane : 5 - car.lane;
+    if (!this.laneClear(car, target, car.distance)) return;
+    const driverNear = this.drivers.some(
+      (driver) =>
+        !driver.crashed &&
+        Math.abs(driver.distance - car.distance) < LANE_CHANGE_DRIVER_CLEARANCE + car.length,
+    );
+    if (driverNear) return;
+    car.laneOffset += laneOffsets[car.lane] - laneOffsets[target];
+    car.lane = target;
   }
 
   private setTrafficCount(requestedCount: number): void {
@@ -674,6 +829,18 @@ export class DrivingGame {
       car.length = size.length;
       car.width = size.width;
     });
+    // The rush-hour wave cars, kept off the road until a wave starts.
+    if (this.traffic.length > 0) {
+      for (let index = 0; index < RUSH_EXTRA_CARS; index += 1) {
+        const car = this.createTrafficCar(1, 0, true);
+        const model = trafficModels[(trafficStart + index + 3) % trafficModels.length];
+        this.vehicleAssets.replaceVisual(car.mesh, model.trafficPrototype, false, model.id);
+        const size = this.vehicleAssets.collisionSize(model.id);
+        car.length = size.length;
+        car.width = size.width;
+        this.rushReserve.push(car);
+      }
+    }
     this.carModelsApplied = true;
   }
 
@@ -702,6 +869,8 @@ export class DrivingGame {
     // Traffic keeps left: lanes 0-1 run toward increasing distance, 2-3 the other way.
     car.lane = (car.direction === 1 ? 0 : 2) + (Math.random() < 0.5 ? 0 : 1);
     car.laneOffset = (Math.random() * 2 - 1) * GAME.trafficLaneJitter;
+    car.restOffset = car.laneOffset;
+    car.laneChangeTimer = 2 + Math.random() * 6;
     // Highway speeds: 80–120 km/h with the driver, 90–130 km/h oncoming.
     car.speed =
       car.direction === facing
@@ -751,6 +920,7 @@ export class DrivingGame {
     // endRace() may have run while drivers stepped.
     if (this.getPhase() !== 'playing') return;
 
+    this.updateRushHour(dt);
     // Everyone on the road, for traffic to see what is ahead of it; drivers are last.
     const roadUsers: RoadUser[] = this.traffic.map((car) => ({
       distance: car.distance,
@@ -770,12 +940,14 @@ export class DrivingGame {
       });
     }
     let trafficIndex = 0;
+    const retired: TrafficCar[] = [];
     for (const car of this.traffic) {
       const owner = this.ownerOf(car);
       car.speedChangeTimer -= dt;
       if (car.speedChangeTimer <= 0) {
-        car.targetSpeed =
-          car.direction === owner.facing
+        car.targetSpeed = car.rush
+          ? this.rushSpeed(car)
+          : car.direction === owner.facing
             ? fromKph(75 + Math.random() * 50)
             : fromKph(85 + Math.random() * 45);
         car.speedChangeTimer = 2.5 + Math.random() * 7;
@@ -788,7 +960,9 @@ export class DrivingGame {
       this.vehicleAssets.setBrakeLights(car.mesh, acceleration < -TRAFFIC_BRAKE_LIGHT_DECELERATION);
       car.speed = Math.max(0, car.speed + acceleration * dt);
       car.distance += car.speed * car.direction * dt;
+      this.maybeChangeLane(car, dt);
       self.distance = car.distance;
+      self.lateral = laneOffsets[car.lane] + car.laneOffset;
       self.velocity = car.speed * car.direction;
       trafficIndex += 1;
 
@@ -815,7 +989,12 @@ export class DrivingGame {
 
       const ownerGap = (car.distance - this.ownerOf(car).distance) * this.ownerOf(car).facing;
       if (ownerGap < (car.direction === this.ownerOf(car).facing ? -70 : -45)) {
+        if (car.rush && !this.rushActive) {
+          retired.push(car);
+          continue;
+        }
         this.spawnTraffic(car, undefined, true);
+        if (car.rush) car.speed = car.targetSpeed = this.rushSpeed(car);
         Object.assign(self, {
           distance: car.distance,
           lateral: laneOffsets[car.lane] + car.laneOffset,
@@ -823,6 +1002,8 @@ export class DrivingGame {
         });
       }
     }
+    // A finished wave's cars leave once they are behind; the list is only changed after the loop.
+    for (const car of retired) this.retireRushCar(car);
     this.collideDrivers();
   }
 

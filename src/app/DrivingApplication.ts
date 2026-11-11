@@ -81,6 +81,7 @@ export class DrivingApplication {
   private secondDriverCar: CarModelId = DEFAULT_CAR_MODEL_ID;
   private playerCount: 1 | 2 = 1;
   private trafficCount = 4;
+  private rushHour = true;
   private modelCount = 1;
   private assetsReady: Promise<boolean> = Promise.resolve(false);
   private sceneReady: Promise<boolean> = Promise.resolve(false);
@@ -160,6 +161,14 @@ export class DrivingApplication {
       'change',
       (event) => {
         this.trafficCount = Number((event.currentTarget as HTMLSelectElement).value);
+      },
+      options,
+    );
+    byId<HTMLSelectElement>('rush-hour').addEventListener(
+      'change',
+      (event) => {
+        this.rushHour = (event.currentTarget as HTMLSelectElement).value === 'on';
+        this.game?.setRushHour(this.rushHour);
       },
       options,
     );
@@ -362,6 +371,7 @@ export class DrivingApplication {
       if (!assetsAvailable || !sceneAvailable || !this.game)
         throw new Error('Required assets are unavailable.');
       this.applyTrack(this.trackSettings.get());
+      this.game.setRushHour(this.rushHour);
       await this.game.setCars(
         this.driverCar,
         this.trafficCount,
