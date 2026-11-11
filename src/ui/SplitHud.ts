@@ -45,7 +45,11 @@ export class SplitHud {
       const panel = this.panels[index];
       if (!panel) return;
       panel.speed.textContent = Math.round(snapshot.speedKph).toString().padStart(3, '0');
-      panel.speedFill.style.width = `${Math.min(100, (snapshot.speedKph / MAX_SPEED_KPH) * 100)}%`;
+      const nitro = snapshot.nitro > 0;
+      panel.root.classList.toggle('is-nitro', nitro);
+      panel.speedFill.style.width = nitro
+        ? `${snapshot.nitro * 100}%`
+        : `${Math.min(100, (snapshot.speedKph / MAX_SPEED_KPH) * 100)}%`;
       panel.distance.textContent = (snapshot.distance / 1000).toFixed(2);
       panel.overtakes.textContent = snapshot.overtakes.toString();
       panel.score.textContent = snapshot.score.toString().padStart(6, '0');

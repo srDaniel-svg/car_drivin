@@ -76,6 +76,8 @@ export interface GameSnapshot {
   assistMessage: string;
   /** How hard the tyres are sliding, 0 to 1, for the skid sound. */
   skid: number;
+  /** Nitro boost left, 1 just after a canister down to 0. */
+  nitro: number;
   /** Lap and timing details on a circuit; null on the free road. */
   race: RaceSnapshot | null;
 }

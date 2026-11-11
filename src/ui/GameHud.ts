@@ -21,6 +21,7 @@ export class GameHud {
   private readonly root = byId<HTMLElement>('hud');
   private readonly speed = byId<HTMLElement>('speed');
   private readonly speedFill = byId<HTMLElement>('speed-fill');
+  private readonly speedPanel = this.speedFill.closest<HTMLElement>('.speed-panel')!;
   private readonly distance = byId<HTMLElement>('distance');
   private readonly overtakes = byId<HTMLElement>('overtakes');
   private readonly score = byId<HTMLElement>('score');
@@ -44,7 +45,12 @@ export class GameHud {
 
   update(snapshot: GameSnapshot, steering: number): void {
     this.speed.textContent = Math.round(snapshot.speedKph).toString().padStart(3, '0');
-    this.speedFill.style.width = `${Math.min(100, (snapshot.speedKph / MAX_SPEED_KPH) * 100)}%`;
+    // While boosting, the bar shows the nitro left instead of the speed.
+    const nitro = snapshot.nitro > 0;
+    this.speedPanel.classList.toggle('is-nitro', nitro);
+    this.speedFill.style.width = nitro
+      ? `${snapshot.nitro * 100}%`
+      : `${Math.min(100, (snapshot.speedKph / MAX_SPEED_KPH) * 100)}%`;
     this.distance.innerHTML = `${(snapshot.distance / 1000).toFixed(2)} <small>KM</small>`;
     this.overtakes.textContent = snapshot.overtakes.toString();
     this.score.textContent = snapshot.score.toString().padStart(6, '0');

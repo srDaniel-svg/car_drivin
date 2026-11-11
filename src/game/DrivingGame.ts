@@ -31,6 +31,13 @@ import type { RadarTarget } from './simulation/cruiseControl';
 import { createSpeedPlan, updateReverseHold } from './simulation/drivingAssist';
 import { createLapState, formatLapTime, racePositions, updateLaps } from './simulation/raceLaps';
 import type { LapState } from './simulation/raceLaps';
+import {
+  NITRO_ACCELERATION,
+  NITRO_MAX_SPEED,
+  NITRO_SECONDS,
+  nitroPickupsBetween,
+  touchesNitro,
+} from './simulation/nitro';
 import { findTrafficLead, trafficAcceleration } from './simulation/trafficFollowing';
 import type { RoadUser } from './simulation/trafficFollowing';
 import {
@@ -131,6 +138,18 @@ interface Driver {
   holdSeconds: number;
   /** Seconds a respawned car passes through others, so it cannot crash again at once. */
   ghostSeconds: number;
+  /** Seconds of nitro boost left. */
+  nitroSeconds: number;
+  /** The boost is pushing the car this frame. */
+  boosting: boolean;
+  /** How strongly the nitro camera effect shows, 0 to 1; eases in fast and out slowly. */
+  nitroFx: number;
+  /** The jolt of grabbing a canister, 1 at the moment it fires and decaying fast. */
+  nitroKick: number;
+  /** Nitro canisters this driver has already taken; they vanish from their view. */
+  readonly collectedNitro: Set<number>;
+  /** Canister meshes drawn along this driver's stretch of road. */
+  readonly nitroMeshes: THREE.Group[];
   readonly forward: THREE.Vector3;
   readonly desiredCamera: THREE.Vector3;
   readonly cameraTarget: THREE.Vector3;
@@ -171,6 +190,11 @@ const RUSH_SPAWN_AHEAD = 470;
 const LANE_CHANGE_CLEARANCE = 26;
 /** Traffic never cuts in this close to a driver. */
 const LANE_CHANGE_DRIVER_CLEARANCE = 28;
+/** Nitro canisters drawn ahead of each driver; more than ever fit in the drawn road. */
+const NITRO_MESHES_PER_DRIVER = 4;
+/** The lens opens this much further during a nitro boost, and this much more at the jolt. */
+const NITRO_FOV_BOOST = 16;
+const NITRO_FOV_KICK = 14;
 /** A race starts after a 3-2-1 countdown with every car held on the line. */
 export const RACE_COUNTDOWN_SECONDS = 3;
 /** Once the first car takes the flag, the others have this long to finish. */
@@ -593,6 +617,12 @@ export class DrivingGame {
       laps: createLapState(),
       holdSeconds: 0,
       ghostSeconds: 0,
+      nitroSeconds: 0,
+      boosting: false,
+      nitroFx: 0,
+      nitroKick: 0,
+      collectedNitro: new Set(),
+      nitroMeshes: Array.from({ length: NITRO_MESHES_PER_DRIVER }, () => this.createNitroMesh()),
       forward: new THREE.Vector3(),
       desiredCamera: new THREE.Vector3(),
       cameraTarget: new THREE.Vector3(),
@@ -602,7 +632,7 @@ export class DrivingGame {
       snapCamera: true,
     };
     this.resetDriver(driver);
-    this.scene.add(driver.mesh);
+    this.scene.add(driver.mesh, ...driver.nitroMeshes);
     this.drivers.push(driver);
     for (const car of this.traffic) car.counted.push(false);
     return driver;
@@ -631,6 +661,11 @@ export class DrivingGame {
     driver.laps = createLapState();
     driver.holdSeconds = 0;
     driver.ghostSeconds = 0;
+    driver.nitroSeconds = 0;
+    driver.boosting = false;
+    driver.nitroFx = 0;
+    driver.nitroKick = 0;
+    driver.collectedNitro.clear();
     driver.snapCamera = true;
     driver.longitudinalAcceleration = 0;
     this.vehicleAssets.setBrakeLights(driver.mesh, false);
@@ -903,6 +938,7 @@ export class DrivingGame {
         continue;
       }
       this.stepDriver(driver, dt);
+      this.collectNitro(driver);
       this.updateRace(driver);
     }
     if (this.finishGrace !== null) {
@@ -1036,8 +1072,26 @@ export class DrivingGame {
     });
     // A keyboard driver overtaking on the accelerator keeps cruise armed.
     driver.cruiseStatus = driver.cruiseOn ? (speedPlan.cruiseStatus ?? 'cruising') : 'off';
-    const { targetSpeed, acceleration, autoBraking } = speedPlan;
+    let { targetSpeed, acceleration } = speedPlan;
+    const { autoBraking } = speedPlan;
     driver.assistMessage = speedPlan.assistMessage;
+    // Nitro pushes the car past its usual top speed, unless the driver (or
+    // cruise, behind a car) is braking or the hands have let go.
+    driver.nitroSeconds = Math.max(0, driver.nitroSeconds - dt);
+    const boosting = (driver.boosting =
+      driver.nitroSeconds > 0 &&
+      control.active &&
+      !speedPlan.braking &&
+      !autoBraking &&
+      targetSpeed > 0 &&
+      driver.speed >= 0 &&
+      driver.cruiseStatus !== 'following' &&
+      driver.cruiseStatus !== 'braking');
+    if (boosting) {
+      targetSpeed = NITRO_MAX_SPEED;
+      acceleration = NITRO_ACCELERATION;
+      driver.assistMessage = `NITRO! ${driver.nitroSeconds.toFixed(1)}s`;
+    }
     if (driver.notice.seconds > 0) {
       driver.notice.seconds -= dt;
       driver.assistMessage = driver.notice.message;
@@ -1292,10 +1346,19 @@ export class DrivingGame {
     driver.lastPosition.copy(mesh.position);
     driver.hasLastPosition = true;
     const speedFraction = clamp(Math.abs(driver.speed) / GAME.maxSpeed, 0, 1);
+    // Nitro: the effect slams in and fades out slowly; the grab itself is a sharp jolt.
+    const nitroLive = driver.boosting && !driver.crashed && this.phase === 'playing';
+    driver.nitroFx = damp(driver.nitroFx, nitroLive ? 1 : 0, nitroLive ? 9 : 1.6, dt);
+    driver.nitroKick *= Math.exp(-3.2 * dt);
+    const { nitroFx: fx, nitroKick: kick } = driver;
+    // The car surges away from the camera, which drops low and trails behind.
     driver.desiredCamera
       .copy(mesh.position)
-      .addScaledVector(driver.forward, -(CAMERA_DISTANCE + CAMERA_SPEED_PULLBACK * speedFraction));
-    driver.desiredCamera.y += 4.3;
+      .addScaledVector(
+        driver.forward,
+        -(CAMERA_DISTANCE + CAMERA_SPEED_PULLBACK * speedFraction + 3.5 * fx + 5 * kick),
+      );
+    driver.desiredCamera.y += 4.3 - 0.9 * fx;
     if (driver.snapCamera) {
       camera.position.copy(driver.desiredCamera);
       driver.snapCamera = false;
@@ -1307,12 +1370,27 @@ export class DrivingGame {
     const time = performance.now() * 0.001;
     const judder = Math.sin(time * 37) * 0.6 + Math.sin(time * 23.7 + 1.3) * 0.4;
     driver.cameraTarget.y += 1 + judder * CAMERA_SHAKE * speedFraction * speedFraction;
+    // Under nitro the whole view rattles hard, sideways and up and down.
+    const rattle = 0.32 * fx + 0.6 * kick;
+    if (rattle > 0.001) {
+      const side = Math.sin(time * 53) * 0.6 + Math.sin(time * 31.3 + 0.7) * 0.4;
+      const lift = Math.sin(time * 61.7 + 2.1) * 0.6 + Math.sin(time * 27.1) * 0.4;
+      driver.cameraTarget.x += side * rattle;
+      driver.cameraTarget.y += lift * rattle;
+    }
     camera.lookAt(driver.cameraTarget);
+    if (rattle > 0.001) camera.rotateZ(Math.sin(time * 41.3 + 0.4) * 0.012 * (fx + kick));
+    driver.postProcessing?.setSpeedBlur(0.2 * fx + 0.14 * kick);
     // Widen the lens with speed for a stronger sense of velocity.
     const baseFov = this.drivers.length > 1 ? SPLIT_BASE_FOV : BASE_FOV;
-    const fov = baseFov + SPEED_FOV_BOOST * clamp(driver.speed / GAME.maxSpeed, 0, 1) ** 1.5;
+    const fov =
+      baseFov +
+      SPEED_FOV_BOOST * clamp(driver.speed / GAME.maxSpeed, 0, 1) ** 1.5 +
+      NITRO_FOV_BOOST * fx +
+      NITRO_FOV_KICK * kick;
     if (Math.abs(camera.fov - fov) > 0.01) {
-      camera.fov = damp(camera.fov, fov, 3, dt);
+      // The lens snaps wide when the nitro fires, then eases back.
+      camera.fov = damp(camera.fov, fov, fx > 0.05 || kick > 0.05 ? 10 : 3, dt);
       camera.updateProjectionMatrix();
     }
   }
@@ -1322,7 +1400,11 @@ export class DrivingGame {
    * world view shows, and the sky, sun shadow, rain and lamps follow them.
    */
   private prepareView(driver: Driver, rainSeconds: number): void {
-    for (const other of this.drivers) other.view.root.visible = other === driver;
+    for (const other of this.drivers) {
+      other.view.root.visible = other === driver;
+      if (other !== driver) for (const mesh of other.nitroMeshes) mesh.visible = false;
+    }
+    this.placeNitro(driver);
     for (const car of this.traffic) {
       const visible = this.inView(driver, car);
       car.mesh.visible = visible;
@@ -1338,6 +1420,75 @@ export class DrivingGame {
     driver.view.rain.update(driver.camera, rainSeconds, driver.view.vehicleLights.headlight);
     driver.view.applyGroundOffset();
     this.updateVehicleLights(driver);
+  }
+
+  /** A glowing canister with a ring round it, so it reads from far down the road. */
+  private createNitroMesh(): THREE.Group {
+    const group = new THREE.Group();
+    const canister = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.9, 0.9, 2.6, 18),
+      new THREE.MeshStandardMaterial({
+        color: 0x1fb6ff,
+        emissive: 0x0a8cff,
+        emissiveIntensity: 1.6,
+        metalness: 0.4,
+        roughness: 0.3,
+      }),
+    );
+    const cap = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.55, 0.9, 0.6, 18),
+      new THREE.MeshStandardMaterial({ color: 0xe8f6ff, metalness: 0.8, roughness: 0.25 }),
+    );
+    cap.position.y = 1.6;
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(2.1, 0.16, 8, 36),
+      new THREE.MeshBasicMaterial({ color: 0x7fe3ff, transparent: true, opacity: 0.85 }),
+    );
+    ring.name = 'nitro-ring';
+    group.add(canister, cap, ring);
+    group.visible = false;
+    return group;
+  }
+
+  /** The canisters on this driver's stretch of road that they have not taken yet. */
+  private nitroAhead(driver: Driver): ReturnType<typeof nitroPickupsBetween> {
+    const behind = driver.distance - 40 * driver.facing;
+    const ahead = driver.distance + (GAME.lookAhead + 60) * driver.facing;
+    return nitroPickupsBetween(behind, ahead, this.lapLength).filter(
+      (pickup) => !driver.collectedNitro.has(pickup.index),
+    );
+  }
+
+  /** Driving through a canister fires the boost straight away. */
+  private collectNitro(driver: Driver): void {
+    for (const pickup of this.nitroAhead(driver)) {
+      if (!touchesNitro(pickup, driver.distance, driver.lateral, laneOffsets[pickup.lane])) continue;
+      driver.collectedNitro.add(pickup.index);
+      driver.nitroSeconds = NITRO_SECONDS;
+      driver.nitroKick = 1;
+      this.showNotice(driver, 'NITRO!', 1);
+    }
+  }
+
+  /** Stands this driver's untaken canisters on the road, bobbing and spinning. */
+  private placeNitro(driver: Driver): void {
+    const pickups = this.nitroAhead(driver);
+    const time = performance.now() * 0.001;
+    driver.nitroMeshes.forEach((mesh, slot) => {
+      const pickup = pickups[slot];
+      mesh.visible = pickup !== undefined && this.phase !== 'ready';
+      if (!pickup) return;
+      const heading = roadHeading(pickup.distance);
+      const offset = laneOffsets[pickup.lane];
+      mesh.position.set(
+        roadCenter(pickup.distance) + Math.cos(heading) * offset,
+        2.1 + Math.sin(time * 3 + pickup.index) * 0.3,
+        -pickup.distance - Math.sin(heading) * offset,
+      );
+      mesh.rotation.y = time * 2;
+      const ring = mesh.getObjectByName('nitro-ring');
+      if (ring) ring.rotation.x = Math.PI / 2 + Math.sin(time * 2 + pickup.index) * 0.25;
+    });
   }
 
   private showNotice(driver: Driver, message: string, seconds = 1.6): void {
@@ -1376,6 +1527,8 @@ export class DrivingGame {
       }
     }
     driver.snapCamera = true;
+    driver.nitroSeconds = 0;
+    driver.boosting = false;
     driver.holdSeconds = RESPAWN_HOLD_SECONDS;
     driver.ghostSeconds = RESPAWN_HOLD_SECONDS + RESPAWN_GHOST_SECONDS;
     this.vehicleAssets.setBrakeLights(driver.mesh, true);
@@ -1475,10 +1628,22 @@ export class DrivingGame {
 
   private renderViews(dt: number, rainSeconds: number): void {
     const usePostProcessing = this.adaptiveQuality.settings.postProcessing;
+    // Low quality has no effect pipeline; it borrows one (without bloom) while the nitro blur shows.
+    const pipelineFor = (driver: Driver): PostProcessing | undefined => {
+      const blurring = driver.nitroFx > 0.01 || driver.nitroKick > 0.01;
+      if (!usePostProcessing && !blurring) return undefined;
+      if (!driver.postProcessing) {
+        driver.postProcessing = new PostProcessing(this.renderer, this.scene, driver.camera);
+        this.resize();
+      }
+      driver.postProcessing.setBloomEnabled(usePostProcessing);
+      return driver.postProcessing;
+    };
     if (this.drivers.length === 1) {
       const [driver] = this.drivers;
       this.prepareView(driver, rainSeconds);
-      if (driver.postProcessing && usePostProcessing) driver.postProcessing.render(dt);
+      const pipeline = pipelineFor(driver);
+      if (pipeline) pipeline.render(dt);
       else this.renderer.render(this.scene, driver.camera);
       return;
     }
@@ -1489,7 +1654,8 @@ export class DrivingGame {
       const { x, y, width, height } = driver.viewport;
       this.renderer.setViewport(x, y, width, height);
       this.renderer.setScissor(x, y, width, height);
-      if (driver.postProcessing && usePostProcessing) driver.postProcessing.render(dt);
+      const pipeline = pipelineFor(driver);
+      if (pipeline) pipeline.render(dt);
       else this.renderer.render(this.scene, driver.camera);
     }
     this.renderer.setScissorTest(false);
@@ -1561,6 +1727,7 @@ export class DrivingGame {
       phase: driver.crashed ? 'crashed' : this.phase,
       assistMessage: driver.assistMessage,
       skid: this.phase === 'playing' && !driver.crashed ? driver.skid : 0,
+      nitro: driver.crashed ? 0 : driver.nitroSeconds / NITRO_SECONDS,
       race: this.raceSnapshot(driver, position),
     };
   }

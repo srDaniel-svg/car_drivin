@@ -1879,6 +1879,21 @@ h2 {
   height: 100%;
   background: var(--player);
 }
+/* Nitro: the speed turns electric blue and the bar shows the boost left. */
+.speed-panel.is-nitro .speed-number > span,
+.is-nitro .split-speed {
+  color: #5fd8ff;
+  text-shadow: 0 0 18px rgba(31, 182, 255, 0.85);
+}
+.speed-panel.is-nitro .speed-track {
+  height: 6px;
+}
+.speed-panel.is-nitro .speed-track span,
+.is-nitro .split-speed-track span {
+  background: #1fb6ff;
+  box-shadow: 0 0 16px rgba(31, 182, 255, 0.9);
+  transition: none;
+}
 .split-stats {
   display: flex;
   justify-content: space-between;
