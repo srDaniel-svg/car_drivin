@@ -266,6 +266,7 @@ export class DrivingGame {
   private finishGrace: number | null = null;
   /** Rush hour: waves of extra, slower traffic that also changes lanes. */
   private rushHourEnabled = true;
+  private endOnFirstFinish = false;
   private rushActive = false;
   /** Seconds until the next wave starts, or until the current one ends. */
   private rushClock = RUSH_FIRST_WAVE_SECONDS;
@@ -441,6 +442,11 @@ export class DrivingGame {
     setActiveTrack(id);
     this.reset();
     this.lastIdleRender = 0;
+  }
+
+  /** Ends a race the moment the first car finishes, instead of waiting for the others. */
+  setEndOnFirstFinish(enabled: boolean): void {
+    this.endOnFirstFinish = enabled;
   }
 
   /** Turns the rush-hour waves on or off; taken up from the next run. */
@@ -1557,7 +1563,9 @@ export class DrivingGame {
       this.showNotice(driver, `FINISHED · ${formatLapTime(laps.finishTime)}`, 3);
       driver.cruiseOn = false;
       driver.cruiseStatus = 'off';
-      if (this.drivers.every((other) => other.laps.finishTime !== null)) this.endRace();
+      // With the surprise quiz on, the first car home stops the race at once.
+      if (this.endOnFirstFinish || this.drivers.every((other) => other.laps.finishTime !== null))
+        this.endRace();
       else this.finishGrace ??= RACE_FINISH_GRACE_SECONDS;
     }
     if (laps.finishTime !== null && driver.notice.seconds <= 0) {

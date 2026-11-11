@@ -25,10 +25,20 @@ import { Minimap } from '../ui/Minimap';
 import { RaceCountdown } from '../ui/RaceCountdown';
 import { SplitHud } from '../ui/SplitHud';
 import { saveBestLap } from '../ui/trackRecords';
+import { launchConfetti } from '../ui/confetti';
+import { QuizOverlay } from '../ui/QuizOverlay';
+import type { QuizMatch } from '../quiz/quizMatch';
 import { TrackSettings } from '../ui/TrackSettings';
 import type { TrackChoice } from '../ui/TrackSettings';
 
 type TrackingState = 'ok' | 'warn' | 'off';
+
+function escapeHtml(text: string): string {
+  return text.replace(
+    /[&<>"']/g,
+    (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!,
+  );
+}
 
 /** Keys that hold each split-screen player's handbrake. */
 const HANDBRAKE_KEYS: readonly (readonly string[])[] = [['Space'], ['ShiftRight']];
@@ -82,6 +92,8 @@ export class DrivingApplication {
   private playerCount: 1 | 2 = 1;
   private trafficCount = 4;
   private rushHour = true;
+  /** Two-player races end in a surprise question for the first car home. */
+  private quizEnabled = true;
   private modelCount = 1;
   private assetsReady: Promise<boolean> = Promise.resolve(false);
   private sceneReady: Promise<boolean> = Promise.resolve(false);
@@ -172,6 +184,14 @@ export class DrivingApplication {
       },
       options,
     );
+    byId<HTMLSelectElement>('quiz-mode').addEventListener(
+      'change',
+      (event) => {
+        this.quizEnabled = (event.currentTarget as HTMLSelectElement).value === 'on';
+        this.game?.setEndOnFirstFinish(this.quizActive());
+      },
+      options,
+    );
     byId<HTMLSelectElement>('car-model-count').addEventListener(
       'change',
       (event) => {
@@ -249,7 +269,10 @@ export class DrivingApplication {
   private setPlayerCount(count: 1 | 2): void {
     this.playerCount = count;
     const split = count === 2;
-    document.querySelector('.second-driver-option')?.classList.toggle('is-hidden', !split);
+    for (const option of document.querySelectorAll('.second-driver-option')) {
+      option.classList.toggle('is-hidden', !split);
+    }
+    this.game?.setEndOnFirstFinish(this.quizActive());
     byId('split-note').classList.toggle('is-hidden', !split);
     byId('driver-car-label').textContent = split ? 'PLAYER 1 CAR' : 'YOUR CAR';
     byId('keyboard-start-keys').textContent = split ? 'P1 WASD · P2 ARROWS' : 'WASD / ARROWS';
@@ -372,6 +395,7 @@ export class DrivingApplication {
         throw new Error('Required assets are unavailable.');
       this.applyTrack(this.trackSettings.get());
       this.game.setRushHour(this.rushHour);
+      this.game.setEndOnFirstFinish(this.quizActive());
       await this.game.setCars(
         this.driverCar,
         this.trafficCount,
@@ -601,6 +625,36 @@ export class DrivingApplication {
   private showRaceResults(results: readonly GameSnapshot[]): void {
     this.audio.setPlaying(false);
     this.raceCountdown.update([]);
+    const winner = results.findIndex(
+      (result) => result.race?.finished && result.race.position === 1,
+    );
+    if (results.length === 2 && this.quizActive() && winner >= 0) {
+      void this.runQuiz(results, winner);
+      return;
+    }
+    this.renderRaceResults(results);
+  }
+
+  private quizActive(): boolean {
+    return this.quizEnabled && this.playerCount === 2;
+  }
+
+  /** The name typed on the start screen, or JUGADOR 1 / JUGADOR 2. */
+  private playerName(index: number): string {
+    const input = document.getElementById(index === 0 ? 'player-one-name' : 'player-two-name');
+    const typed = input instanceof HTMLInputElement ? input.value.trim().toUpperCase() : '';
+    return typed || `JUGADOR ${index + 1}`;
+  }
+
+  /** The race is paused on the line while the surprise quiz decides the champion. */
+  private async runQuiz(results: readonly GameSnapshot[], winner: number): Promise<void> {
+    const quiz = new QuizOverlay(this.overlay, [this.playerName(0), this.playerName(1)]);
+    const match = await quiz.run(winner, this.events.signal);
+    if (this.events.signal.aborted) return;
+    this.renderRaceResults(results, match);
+  }
+
+  private renderRaceResults(results: readonly GameSnapshot[], quiz?: QuizMatch): void {
     this.overlay.classList.remove('is-hidden');
     const { trackId } = this.trackSettings.get();
     const track = getTrack(trackId);
@@ -636,26 +690,59 @@ export class DrivingApplication {
             : `DNF · LAP ${race?.lap ?? 1}/${race?.laps ?? 1}`;
           return `
             <div class="split-result${race?.finished && position === 1 ? ' is-winner' : ''}">
-              <span>${position}${ordinalSuffix(position)} · PLAYER ${index + 1}</span>
+              <span>${position}${ordinalSuffix(position)} · ${quiz ? escapeHtml(this.playerName(index)) : `PLAYER ${index + 1}`}</span>
               <b>${time}</b>
               <small>BEST LAP ${formatLapTime(race?.bestLap ?? null)}</small>
             </div>`;
         })
         .join('')}</div>`;
     }
+    const champion = quiz ? this.championMarkup(results, quiz) : `<h2>${headline}</h2>`;
     this.overlay.innerHTML = `
-      <div class="modal results-modal">
+      <div class="modal results-modal${quiz ? ' has-champion' : ''}">
         <div class="eyebrow"><span></span> RACE COMPLETE · ${track.name.toUpperCase()}</div>
-        <h2>${headline}</h2>
+        ${champion}
         ${record}
         ${summary}
         <div id="results-track-slot" class="results-track-slot"></div>
-        <button id="restart-run" class="primary-button"><span>RACE AGAIN</span><i>↻</i></button>
+        <button id="restart-run" class="primary-button"><span>${quiz ? 'NUEVA CARRERA' : 'RACE AGAIN'}</span><i>↻</i></button>
       </div>`;
     byId('results-track-slot').append(this.trackSettings.element);
-    byId('restart-run').addEventListener('click', () => this.beginRun(), {
-      signal: this.events.signal,
-    });
+    const confetti = new AbortController();
+    if (quiz) launchConfetti(this.overlay, 5500, confetti.signal);
+    byId('restart-run').addEventListener(
+      'click',
+      () => {
+        confetti.abort();
+        this.beginRun();
+      },
+      { signal: this.events.signal },
+    );
+  }
+
+  /** The quiz champion: trophy, name, score, time and right answers. */
+  private championMarkup(results: readonly GameSnapshot[], quiz: QuizMatch): string {
+    const index = quiz.champion ?? quiz.raceWinner;
+    const result = results[index];
+    const race = result?.race;
+    const how =
+      quiz.correct[index] > 0
+        ? index === quiz.raceWinner
+          ? '¡Llegó primero y respondió bien!'
+          : '¡Robó la victoria con la respuesta correcta!'
+        : 'Nadie acertó: la victoria es para quien llegó primero.';
+    return `
+      <div class="champion" data-player="${index}">
+        <div class="champion-trophy" aria-hidden="true">🏆</div>
+        <div class="champion-label">¡CAMPEÓN!</div>
+        <h2 class="champion-name">${escapeHtml(this.playerName(index))}</h2>
+        <p class="champion-how">${how}</p>
+        <div class="final-stats champion-stats">
+          <div><span>PUNTUACIÓN</span><b>${result?.score ?? 0}</b></div>
+          <div><span>TIEMPO</span><b>${race?.finished ? formatLapTime(race.totalTime) : 'DNF'}</b></div>
+          <div><span>RESPUESTAS CORRECTAS</span><b>${quiz.correct[index]}</b></div>
+        </div>
+      </div>`;
   }
 
   private showCrash(): void {
