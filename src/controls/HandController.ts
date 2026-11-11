@@ -14,6 +14,8 @@ import {
   isVictorySign,
   SustainedGesture,
 } from './handGestures';
+import { FULL_FRAME, isFullFrame, regionRect, regionToFrame } from './cameraRegion';
+import type { CameraRegion } from './cameraRegion';
 import type { HandTrackingResult, HandWorkerInput, HandWorkerOutput } from './handWorkerTypes';
 import {
   defaultWheelPose,
@@ -27,10 +29,10 @@ type TrackingStatus = 'idle' | 'loading' | 'ready' | 'calibrating' | 'tracking' 
 
 /** One-off requests made by holding a gesture, for features beyond driving. */
 export type HandCommand = 'cruise-toggle' | 'cruise-faster' | 'cruise-slower';
-const INFERENCE_INTERVAL_MS = 1000 / 20;
+const INFERENCE_INTERVAL_MS = 1000 / 15;
 // The wheel animates every camera frame (capped) for smooth motion between
 // 20 Hz tracking results.
-const PREVIEW_INTERVAL_MS = 1000 / 30;
+const PREVIEW_INTERVAL_MS = 1000 / 20;
 const CALIBRATION_SAMPLES = 45;
 /** After losing the hands for this long, the ghost wheel drifts back to centre. */
 const WHEEL_RETURN_MS = 1500;
@@ -41,9 +43,34 @@ const CRUISE_TOGGLE_HOLD_MS = 800;
 const CRUISE_STEP_HOLD_MS = 450;
 const CRUISE_STEP_REPEAT_MS = 550;
 
+/**
+ * Opens the user-facing camera into `video`. One player asks for a small
+ * picture; two players sharing one camera need it wide and sharp enough that
+ * each half still shows a pair of hands clearly.
+ */
+export async function openCamera(
+  video: HTMLVideoElement,
+  quality: 'single' | 'split' = 'single',
+): Promise<MediaStream> {
+  const size =
+    quality === 'split' ? { width: { ideal: 1280 }, height: { ideal: 720 } } : SINGLE_CAMERA_SIZE;
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { ...size, facingMode: 'user' },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  return stream;
+}
+
+const SINGLE_CAMERA_SIZE = { width: { ideal: 160 }, height: { ideal: 120 } };
+
 export class HandController {
   private landmarker: HandLandmarker | null = null;
   private stream: MediaStream | null = null;
+  /** Only a controller that opened the camera itself closes it. */
+  private ownsStream = false;
+  private cropCanvas: HTMLCanvasElement | null = null;
   private worker: Worker | null = null;
   private raf = 0;
   private videoFrameCallback = 0;
@@ -83,18 +110,22 @@ export class HandController {
     private readonly canvas: HTMLCanvasElement,
     private readonly onStatus: (status: TrackingStatus, progress?: number) => void,
     private readonly onCommand: (command: HandCommand) => void = () => undefined,
+    /** The part of the camera picture this player sits in (split screen). */
+    private readonly region: CameraRegion = FULL_FRAME,
   ) {}
 
   async start(): Promise<void> {
     this.stopped = false;
     this.setStatus('loading');
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 320 }, height: { ideal: 240 }, facingMode: 'user' },
-        audio: false,
-      });
-      this.video.srcObject = this.stream;
-      await this.video.play();
+      // A camera shared between split-screen players is opened by the app.
+      if (this.video.srcObject instanceof MediaStream) {
+        this.stream = this.video.srcObject;
+        this.ownsStream = false;
+      } else {
+        this.stream = await openCamera(this.video);
+        this.ownsStream = true;
+      }
       if (this.stopped) return;
 
       const wasmRoot = new URL(`${import.meta.env.BASE_URL}mediapipe/wasm`, window.location.href)
@@ -250,7 +281,7 @@ export class HandController {
     this.worker?.terminate();
     this.worker = null;
     this.frameInFlight = false;
-    this.stream?.getTracks().forEach((track) => track.stop());
+    if (this.ownsStream) this.stream?.getTracks().forEach((track) => track.stop());
     this.landmarker?.close();
     this.landmarker = null;
   }
@@ -307,7 +338,7 @@ export class HandController {
     if (this.worker) {
       if (this.frameInFlight) return;
       this.frameInFlight = true;
-      void createImageBitmap(this.video)
+      void this.grabFrame()
         .then((frame) => {
           if (this.stopped || !this.worker) {
             frame.close();
@@ -325,17 +356,45 @@ export class HandController {
     }
 
     if (this.landmarker) {
-      const result = this.serializeResult(this.landmarker.detectForVideo(this.video, now));
+      const detected = this.landmarker.detectForVideo(this.cropSource(), now);
+      const result = regionToFrame(this.serializeResult(detected), this.region);
       this.consumeResult(result);
       this.updateWheelTarget(result);
     }
   }
 
+  /** This player's part of the current video frame, for the tracking worker. */
+  private grabFrame(): Promise<ImageBitmap> {
+    if (isFullFrame(this.region)) return createImageBitmap(this.video);
+    const { x, y, width, height } = this.cropRect();
+    return createImageBitmap(this.video, x, y, width, height);
+  }
+
+  /** This player's part of the current video frame, for main-thread tracking. */
+  private cropSource(): HTMLVideoElement | HTMLCanvasElement {
+    if (isFullFrame(this.region)) return this.video;
+    const { x, y, width, height } = this.cropRect();
+    this.cropCanvas ??= document.createElement('canvas');
+    if (this.cropCanvas.width !== width || this.cropCanvas.height !== height) {
+      this.cropCanvas.width = width;
+      this.cropCanvas.height = height;
+    }
+    this.cropCanvas
+      .getContext('2d')
+      ?.drawImage(this.video, x, y, width, height, 0, 0, width, height);
+    return this.cropCanvas;
+  }
+
+  private cropRect(): { x: number; y: number; width: number; height: number } {
+    return regionRect(this.region, this.video.videoWidth || 320, this.video.videoHeight || 240);
+  }
+
   private handleWorkerMessage = (event: MessageEvent<HandWorkerOutput>): void => {
     if (event.data.type === 'result') {
       this.frameInFlight = false;
-      this.consumeResult(event.data.result);
-      this.updateWheelTarget(event.data.result);
+      const result = regionToFrame(event.data.result, this.region);
+      this.consumeResult(result);
+      this.updateWheelTarget(result);
     } else if (event.data.type === 'error') {
       this.frameInFlight = false;
       void this.activateMainThreadFallback(new Error(event.data.message));
@@ -526,7 +585,7 @@ export class HandController {
     const target =
       this.wheelTarget && sinceSeen < WHEEL_RETURN_MS
         ? this.wheelTarget
-        : defaultWheelPose(width, height);
+        : this.restingWheelPose(width, height);
     this.wheelPose = this.wheelPose ? smoothWheelPose(this.wheelPose, target, dt) : { ...target };
     const gripping = this.wheelGrip && sinceSeen < 300;
     this.wheelAlpha = damp(this.wheelAlpha, gripping ? 1 : 0.38, 8, dt);
@@ -549,6 +608,13 @@ export class HandController {
       mirrored: true,
     });
     context.restore();
+  }
+
+  /** Where the ghost wheel waits: the middle of this player's part of the picture. */
+  private restingWheelPose(width: number, height: number): WheelPose {
+    const rect = regionRect(this.region, width, height);
+    const pose = defaultWheelPose(rect.width, height);
+    return { ...pose, x: pose.x + rect.x };
   }
 
   private setStatus(status: TrackingStatus, progress?: number): void {

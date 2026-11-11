@@ -149,7 +149,7 @@ export class ForestSystem {
   private nearLayer?: ForestLayer;
   private nearVisible = true;
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     for (let chunk = 0; chunk < CHUNK_COUNT; chunk += 1) this.chunkIndices.push(chunk - 2);
     this.addLayer({
       meshes: [this.createInstancedMesh(this.geometry, this.material, FAR_TREES_PER_CHUNK, 'far')],

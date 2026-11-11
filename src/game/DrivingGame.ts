@@ -11,10 +11,9 @@ import {
   HANDBRAKE_YAW_BOOST,
   roadCenter,
   roadHeading,
-  roadWindowStart,
+  setActiveTrack,
   steeringYawRate,
 } from './math';
-import { createRoadStrip, updateRoadStrip } from './roadSurface';
 import { AdaptiveQuality, chooseInitialQuality } from './rendering/AdaptiveQuality';
 import type { GraphicsQualityMode, RenderQualitySettings } from './rendering/AdaptiveQuality';
 import { installKeyLightGlintControl, setKeyLightGlint } from './rendering/keyLightGlint';
@@ -28,7 +27,10 @@ import {
   cruiseStaysEngaged,
   findLeadVehicle,
 } from './simulation/cruiseControl';
+import type { RadarTarget } from './simulation/cruiseControl';
 import { createSpeedPlan, updateReverseHold } from './simulation/drivingAssist';
+import { createLapState, formatLapTime, racePositions, updateLaps } from './simulation/raceLaps';
+import type { LapState } from './simulation/raceLaps';
 import { findTrafficLead, trafficAcceleration } from './simulation/trafficFollowing';
 import type { RoadUser } from './simulation/trafficFollowing';
 import {
@@ -38,7 +40,9 @@ import {
   updateSceneShadow,
 } from './sceneAssets';
 import type { SceneLighting } from './sceneAssets';
-import type { ControlInput, CruiseStatus, GamePhase, GameSnapshot } from './types';
+import { DEFAULT_LAPS, DEFAULT_TRACK_ID, getTrack } from './tracks';
+import type { TrackId } from './tracks';
+import type { ControlInput, CruiseStatus, GamePhase, GameSnapshot, RaceSnapshot } from './types';
 import { VehicleAssets } from './vehicleAssets';
 import type { LoadedCarModel } from './vehicleAssets';
 import { DEFAULT_CAR_MODEL_ID, selectCarModelIds } from './vehicleCatalog';
@@ -46,15 +50,9 @@ import type { CarModelId } from './vehicleCatalog';
 import { installAtmosphericFog, setAtmosphericScattering } from './world/atmosphere';
 import { createEnvironmentLook, DEFAULT_CONDITIONS } from './world/conditions';
 import type { DrivingConditions, EnvironmentLook } from './world/conditions';
-import { ForestSystem } from './world/ForestSystem';
-import { LaneMarkings } from './world/LaneMarkings';
 import { MountainRange } from './world/MountainRange';
-import { RoadsideFenceSystem } from './world/RoadsideFenceSystem';
-import { RainSystem } from './world/RainSystem';
-import { RoadsideScenerySystem } from './world/RoadsideScenerySystem';
 import { SkySystem } from './world/SkySystem';
-import { StreetLightSystem } from './world/StreetLightSystem';
-import { VehicleLightSystem } from './world/VehicleLightSystem';
+import { GRASS_TEXTURE_REPEAT, GROUND_SIZE, WorldView } from './world/WorldView';
 
 interface TrafficCar {
   mesh: THREE.Group;
@@ -65,18 +63,82 @@ interface TrafficCar {
   targetSpeed: number;
   speedChangeTimer: number;
   direction: 1 | -1;
-  counted: boolean;
+  /** The driver this car spawns ahead of and is recycled around. */
+  owner: number;
+  /** Per driver: the car is already behind them, so passing it no longer counts. */
+  counted: boolean[];
   /** Collision envelope of the car's model, in world units. */
   length: number;
   width: number;
 }
 
-const GROUND_SIZE = 1200;
-const GRASS_TEXTURE_REPEAT = 30;
-const GRASS_TILE_METERS = GROUND_SIZE / GRASS_TEXTURE_REPEAT;
-const ROAD_UPDATE_INTERVAL = 1 / 30;
+interface Viewport {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** One player's car, its chase camera, and the stretch of world drawn for them. */
+interface Driver {
+  index: number;
+  mesh: THREE.Group;
+  carModel: CarModelId;
+  camera: THREE.PerspectiveCamera;
+  view: WorldView;
+  postProcessing?: PostProcessing;
+  viewport: Viewport;
+  distance: number;
+  speed: number;
+  lateral: number;
+  worldX: number;
+  vehicleHeading: number;
+  /** Direction of travel; it lags the nose while the handbrake slides the car. */
+  travelHeading: number;
+  /** The rear wheels are locked by the handbrake this frame. */
+  rearWheelsLocked: boolean;
+  /** How hard the tyres are sliding, 0 to 1. */
+  skid: number;
+  steeringVisual: number;
+  longitudinalAcceleration: number;
+  /** Seconds the full brake has been held at a standstill; engages reverse. */
+  reverseHoldSeconds: number;
+  /** Which way along the road the car points: 1 the original way, -1 after a U-turn. */
+  facing: 1 | -1;
+  /** Cosine between the camera's view and the road's forward direction. */
+  viewAlong: number;
+  /** Distance driven in forward gear; the score counts this, not the position. */
+  odometer: number;
+  /** Adaptive cruise: on/off, its set speed (kept while off) and what it is doing. */
+  cruiseOn: boolean;
+  cruiseSetKph: number;
+  cruiseStatus: CruiseStatus;
+  /** A short-lived HUD message, such as a refused cruise request. */
+  notice: { message: string; seconds: number };
+  overtakes: number;
+  assistMessage: string;
+  /** This driver hit something; their run is over while others may drive on. */
+  crashed: boolean;
+  /** Laps and lap times on a circuit. */
+  laps: LapState;
+  /** Seconds a respawned car is held still on the line before it may drive. */
+  holdSeconds: number;
+  /** Seconds a respawned car passes through others, so it cannot crash again at once. */
+  ghostSeconds: number;
+  readonly forward: THREE.Vector3;
+  readonly desiredCamera: THREE.Vector3;
+  readonly cameraTarget: THREE.Vector3;
+  readonly viewDirection: THREE.Vector3;
+  readonly lastPosition: THREE.Vector3;
+  hasLastPosition: boolean;
+  /** Put the chase camera straight behind the car next frame instead of easing it there. */
+  snapCamera: boolean;
+}
+
 const IDLE_RENDER_INTERVAL_MS = 200;
 const BASE_FOV = 56;
+/** Split-screen views are narrow, so their lens opens wider to keep the road in view. */
+const SPLIT_BASE_FOV = 68;
 const SPEED_FOV_BOOST = 9;
 const CAMERA_DISTANCE = 8.5;
 /** The chase camera eases back this much further at top speed. */
@@ -89,6 +151,20 @@ const TRAFFIC_SPAWN_AHEAD = 260;
 const TRAFFIC_BRAKE_LIGHT_DECELERATION = 2;
 /** The view must turn this far past side-on before traffic treats it as the new way ahead. */
 const FACING_HYSTERESIS = 0.2;
+/** A race starts after a 3-2-1 countdown with every car held on the line. */
+export const RACE_COUNTDOWN_SECONDS = 3;
+/** Once the first car takes the flag, the others have this long to finish. */
+export const RACE_FINISH_GRACE_SECONDS = 30;
+/** A car that crashes in a race is put back in its lane and held this long. */
+const RESPAWN_HOLD_SECONDS = 2;
+/** Then it drives through other cars for this long. */
+const RESPAWN_GHOST_SECONDS = 3;
+/** A car that has taken the flag brakes to a stop on its own. */
+const FINISHED_CONTROL: ControlInput = { steering: 0, confidence: 1, active: true, braking: true };
+/** Player two's paint, so two drivers of the same model can tell their cars apart. */
+const SECOND_DRIVER_COLOR = 0x1f5fe0;
+/** Each driver starts in their own lane going the same way: player one outside, two inside. */
+const DRIVER_START_LANES = [0, 1] as const;
 /** Dry and fully wet values for the road, verge and meadow surfaces. */
 const SURFACE_WETNESS = {
   road: { roughness: [0.96, 0.36], brightness: [1, 0.64], reflection: [1, 1.5] },
@@ -98,91 +174,59 @@ const SURFACE_WETNESS = {
 
 export class DrivingGame {
   private readonly scene = new THREE.Scene();
-  private readonly camera = new THREE.PerspectiveCamera(BASE_FOV, 1, 0.1, 2400);
   private readonly renderer: THREE.WebGLRenderer;
   private readonly performanceMonitor = new PerformanceMonitor();
   private readonly adaptiveQuality: AdaptiveQuality;
   private readonly clock = new THREE.Clock();
   private readonly vehicleAssets = new VehicleAssets();
-  private readonly player = new THREE.Group();
+  private readonly drivers: Driver[] = [];
   private readonly traffic: TrafficCar[] = [];
   private readonly sky: SkySystem;
   private readonly fog: THREE.FogExp2;
-  private readonly vehicleLights: VehicleLightSystem;
-  private readonly streetLights: StreetLightSystem;
-  private readonly rain: RainSystem;
   private readonly drawingBufferSize = new THREE.Vector2();
   private look?: EnvironmentLook;
   private readonly mountainRange: MountainRange;
-  private readonly forest: ForestSystem;
-  private postProcessing?: PostProcessing;
   private readonly lighting: SceneLighting;
   private readonly textureStore: SurfaceTextureStore;
   private readonly sceneryAssets: SceneryAssets;
   private readonly sceneAssetsReady: Promise<void>;
-  private readonly roadsideFences: RoadsideFenceSystem;
-  private readonly roadsideScenery: RoadsideScenerySystem;
-  private readonly roadGeometry: THREE.BufferGeometry;
-  private readonly roadMesh: THREE.Mesh;
-  private readonly shoulderGeometry: THREE.BufferGeometry;
-  private readonly shoulderMesh: THREE.Mesh;
-  private readonly laneMarkings: LaneMarkings;
-  private readonly ground: THREE.Mesh;
-  private readonly forward = new THREE.Vector3();
+  private readonly roadMaterial: THREE.MeshStandardMaterial;
+  private readonly shoulderMaterial: THREE.MeshStandardMaterial;
+  private readonly groundMaterial: THREE.MeshStandardMaterial;
+  private readonly groundGeometry = new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE);
   private readonly shadowCenter = new THREE.Vector3();
-  private readonly desiredCamera = new THREE.Vector3();
-  private readonly cameraTarget = new THREE.Vector3();
+  private pineTree?: THREE.Object3D;
   private phase: GamePhase = 'ready';
-  private distance = 0;
-  private speed = 0;
-  private lateral: number = laneOffsets[0];
-  private worldX = roadCenter(0) + Math.cos(roadHeading(0)) * laneOffsets[0];
-  private vehicleHeading = roadHeading(0);
-  /** Direction of travel; it lags the nose while the handbrake slides the car. */
-  private travelHeading = roadHeading(0);
-  /** The rear wheels are locked by the handbrake this frame. */
-  private rearWheelsLocked = false;
-  /** How hard the tyres are sliding, 0 to 1. */
-  private skid = 0;
-  private steeringVisual = 0;
-  private longitudinalAcceleration = 0;
-  /** Seconds the full brake has been held at a standstill; engages reverse. */
-  private reverseHoldSeconds = 0;
-  /** Which way along the road the car points: 1 the original way, -1 after a U-turn. */
-  private facing: 1 | -1 = 1;
-  /** Cosine between the camera's view and the road's forward direction. */
-  private viewAlong = 1;
-  /** Distance driven in forward gear; the score counts this, not the position. */
-  private odometer = 0;
-  /** Adaptive cruise: on/off, its set speed (kept while off) and what it is doing. */
-  private cruiseOn = false;
-  private cruiseSetKph = CRUISE_DEFAULT_KPH;
-  private cruiseStatus: CruiseStatus = 'off';
-  /** A short-lived HUD message, such as a refused cruise request. */
-  private notice = { message: '', seconds: 0 };
-  private readonly viewDirection = new THREE.Vector3();
-  private readonly lastPlayerPosition = new THREE.Vector3();
-  private hasLastPlayerPosition = false;
-  private overtakes = 0;
-  private assistMessage = 'READY';
-  private driverCar: CarModelId = DEFAULT_CAR_MODEL_ID;
   private carModelsPromise?: Promise<LoadedCarModel[]>;
   private carModelsApplied = false;
   private sceneAssetsLoaded = false;
   private lastSnapshot = 0;
   private lastIdleRender = 0;
-  private roadUpdateElapsed = Number.POSITIVE_INFINITY;
-  private lastRoadUpdateDistance = Number.NaN;
   private animationFrame = 0;
   private performanceMonitoring = false;
   private graphicsQualityMode: GraphicsQualityMode = 'auto';
   private pendingRenderQuality?: RenderQualitySettings;
+  private denseForest = false;
+  private trackId: TrackId = DEFAULT_TRACK_ID;
+  /** Lap length of the circuit being raced, or null on the free road. */
+  private lapLength: number | null = null;
+  private totalLaps = DEFAULT_LAPS;
+  /** Seconds of racing since the start; stops while paused. */
+  private raceTime = 0;
+  /**
+   * Seconds left before the start lights go green. It keeps counting below
+   * zero for a moment so the HUD can show GO; −Infinity once that is over.
+   */
+  private countdown = Number.NEGATIVE_INFINITY;
+  /** Seconds the others have left to finish once someone has won; null until then. */
+  private finishGrace: number | null = null;
 
   constructor(
     private readonly container: HTMLElement,
-    private readonly getControl: () => ControlInput,
-    private readonly onUpdate: (snapshot: GameSnapshot) => void,
+    private readonly getControl: (playerIndex: number) => ControlInput,
+    private readonly onUpdate: (snapshots: GameSnapshot[]) => void,
     private readonly onCrash: () => void,
+    private readonly onRaceFinish: (results: GameSnapshot[]) => void,
     private readonly onPerformanceUpdate: (snapshot: PerformanceSnapshot) => void,
   ) {
     // Aerial-perspective fog, the key-light glint control and the vivid tone
@@ -221,14 +265,13 @@ export class DrivingGame {
     this.scene.add(this.sky.mesh);
     this.mountainRange = new MountainRange();
     this.scene.add(this.mountainRange.mesh);
-    this.forest = new ForestSystem(this.scene);
     // Apply the starting tier on the first frame (creates the effect composer
     // when post-processing is enabled, including in Auto mode).
     this.pendingRenderQuality = this.adaptiveQuality.settings;
 
     this.textureStore = new SurfaceTextureStore(this.renderer.capabilities.getMaxAnisotropy());
 
-    const roadMaterial = this.textureStore.createMaterial(
+    this.roadMaterial = this.textureStore.createMaterial(
       'RoadLines_baseColor.jpeg',
       'RoadLines_normal.png',
       'RoadLines_metallicRoughness.png',
@@ -238,7 +281,7 @@ export class DrivingGame {
         tint: 0xffffff,
       },
     );
-    const shoulderMaterial = this.textureStore.createMaterial(
+    this.shoulderMaterial = this.textureStore.createMaterial(
       'Sidewalk01_baseColor.jpeg',
       'Sidewalk01_normal.png',
       'Sidewalk01_metallicRoughness.png',
@@ -248,7 +291,7 @@ export class DrivingGame {
         tint: 0xffffff,
       },
     );
-    const groundMaterial = this.textureStore.createMaterial(
+    this.groundMaterial = this.textureStore.createMaterial(
       'Grass02_baseColor.jpeg',
       'Grass02_normal.png',
       'Grass02_metallicRoughness.png',
@@ -260,46 +303,22 @@ export class DrivingGame {
         tint: 0xffffff,
       },
     );
-    applyGroundVariation(groundMaterial);
+    applyGroundVariation(this.groundMaterial);
     this.sceneryAssets = new SceneryAssets();
 
-    this.roadGeometry = createRoadStrip(GAME.roadWidth, 320, 0, 1, GAME.roadWidth);
-    this.roadMesh = new THREE.Mesh(this.roadGeometry, roadMaterial);
-    this.roadMesh.receiveShadow = true;
-    this.scene.add(this.roadMesh);
-
-    this.shoulderGeometry = createRoadStrip(GAME.roadWidth + 5.5, 320);
-    this.shoulderMesh = new THREE.Mesh(this.shoulderGeometry, shoulderMaterial);
-    this.shoulderMesh.position.y = -0.055;
-    this.shoulderMesh.receiveShadow = true;
-    this.scene.add(this.shoulderMesh);
-    this.laneMarkings = new LaneMarkings(this.scene);
-
-    this.ground = new THREE.Mesh(new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE), groundMaterial);
-    this.ground.rotation.x = -Math.PI / 2;
-    this.ground.position.y = -0.09;
-    this.ground.receiveShadow = true;
-    this.scene.add(this.ground);
-
-    this.roadsideFences = new RoadsideFenceSystem(this.scene);
-    this.roadsideScenery = new RoadsideScenerySystem(this.scene);
-
     this.lighting = addSceneLighting(this.scene, this.adaptiveQuality.settings.shadowMapSize);
-    this.vehicleLights = new VehicleLightSystem(this.scene);
-    this.streetLights = new StreetLightSystem(this.scene);
-    this.rain = new RainSystem(this.scene);
+    this.addDriver(DEFAULT_CAR_MODEL_ID);
     this.setupTraffic();
     this.setConditions(DEFAULT_CONDITIONS);
     const natureReady = this.sceneryAssets.loadNature().then(() => {
       const pine = this.sceneryAssets.getPineTreePrototype();
       if (!pine) return;
-      this.forest.setNearModel(pine);
-      this.roadsideScenery.setTreeModel(pine);
+      this.pineTree = pine;
+      for (const driver of this.drivers) driver.view.setTreeModel(pine);
     });
     this.sceneAssetsReady = Promise.all([this.textureStore.whenReady(), natureReady]).then(() => {
       this.sceneAssetsLoaded = true;
     });
-    this.scene.add(this.player);
     this.resize();
     window.addEventListener('resize', this.resize);
     this.animationFrame = requestAnimationFrame(this.animate);
@@ -309,7 +328,11 @@ export class DrivingGame {
     if (!this.sceneAssetsLoaded || !this.carModelsApplied) {
       throw new Error('The game cannot start before all required assets load.');
     }
-    if (this.phase === 'crashed') this.reset();
+    if (this.phase === 'crashed' || this.phase === 'finished') this.reset();
+    if (this.phase === 'ready' && this.lapLength !== null) {
+      this.countdown = RACE_COUNTDOWN_SECONDS;
+      for (const driver of this.drivers) driver.assistMessage = 'GET READY';
+    }
     this.phase = 'playing';
     this.clock.getDelta();
   }
@@ -317,7 +340,9 @@ export class DrivingGame {
   pause(): void {
     if (this.phase === 'playing') {
       this.phase = 'paused';
-      this.assistMessage = 'PAUSED';
+      for (const driver of this.drivers) {
+        if (!driver.crashed) driver.assistMessage = 'PAUSED';
+      }
     }
   }
 
@@ -329,28 +354,15 @@ export class DrivingGame {
   }
 
   reset(): void {
-    this.distance = 0;
-    this.speed = 0;
-    this.lateral = laneOffsets[0];
-    this.worldX = roadCenter(0) + Math.cos(roadHeading(0)) * laneOffsets[0];
-    this.vehicleHeading = roadHeading(0);
-    this.travelHeading = this.vehicleHeading;
-    this.rearWheelsLocked = false;
-    this.skid = 0;
-    this.overtakes = 0;
-    this.assistMessage = 'READY';
-    this.reverseHoldSeconds = 0;
-    this.facing = 1;
-    this.viewAlong = 1;
-    this.odometer = 0;
-    this.cruiseOn = false;
-    this.cruiseStatus = 'off';
-    this.notice.seconds = 0;
+    for (const driver of this.drivers) this.resetDriver(driver);
     this.phase = 'ready';
-    this.vehicleAssets.setBrakeLights(this.player, false);
+    this.raceTime = 0;
+    this.countdown = Number.NEGATIVE_INFINITY;
+    this.finishGrace = null;
     let ongoingCursor = 45;
     let incomingCursor = 62;
     this.traffic.forEach((car, index) => {
+      car.owner = index % this.drivers.length;
       car.direction = index === 0 ? 1 : index === 1 ? -1 : Math.random() < 0.56 ? 1 : -1;
       if (car.direction === 1) {
         ongoingCursor += 34 + Math.random() * 48;
@@ -360,13 +372,30 @@ export class DrivingGame {
         this.spawnTraffic(car, incomingCursor);
       }
     });
-    this.roadsideScenery.reset();
-    this.longitudinalAcceleration = 0;
-    this.forest.reset();
+  }
+
+  /**
+   * Chooses the road and, on a circuit, how many laps the race runs. Puts
+   * every car back on the start line, so it is only accepted between runs.
+   */
+  setTrack(id: TrackId, laps: number = DEFAULT_LAPS): void {
+    if (this.phase === 'playing' || this.phase === 'paused') return;
+    this.totalLaps = Math.max(1, Math.round(laps));
+    if (id === this.trackId) return;
+    this.trackId = id;
+    this.lapLength = getTrack(id).length;
+    setActiveTrack(id);
+    this.reset();
+    this.lastIdleRender = 0;
   }
 
   getPhase(): GamePhase {
     return this.phase;
+  }
+
+  /** How many drivers share the screen. */
+  getPlayerCount(): number {
+    return this.drivers.length;
   }
 
   refreshViewport(): void {
@@ -406,70 +435,170 @@ export class DrivingGame {
     this.scene.environmentIntensity = look.environmentIntensity;
     this.renderer.toneMappingExposure = look.exposure;
     applySceneLighting(this.lighting, look);
-    this.vehicleLights.setLook(look);
-    this.streetLights.setLook(look);
+    for (const driver of this.drivers) driver.view.setLook(look);
     this.vehicleAssets.setRunningLights(look.vehicleLights);
-    for (const car of [this.player, ...this.traffic.map((traffic) => traffic.mesh)]) {
+    const cars = [
+      ...this.drivers.map((driver) => driver.mesh),
+      ...this.traffic.map((traffic) => traffic.mesh),
+    ];
+    for (const car of cars) {
       this.vehicleAssets.setBrakeLights(car, this.vehicleAssets.isBraking(car));
     }
-    this.rain.setRain(look.rain, look.rainColor);
     this.applyWetness(look.wetness);
     this.lastIdleRender = 0;
   }
 
   /**
-   * Turns adaptive cruise on (it drives toward the set speed, even from a
-   * standstill) or off. Only while driving forward.
+   * Turns a driver's adaptive cruise on (it drives toward the set speed, even
+   * from a standstill) or off. Only while driving forward.
    */
-  toggleCruise(): void {
-    if (this.phase !== 'playing') return;
-    if (this.cruiseOn) {
-      this.cruiseOn = false;
-      this.cruiseStatus = 'off';
-      this.showNotice('CRUISE OFF');
-    } else if (this.speed < -0.3) {
-      this.showNotice('STOP BEFORE CRUISE');
+  toggleCruise(playerIndex = 0): void {
+    const driver = this.drivers[playerIndex];
+    if (this.phase !== 'playing' || !driver || driver.crashed) return;
+    if (driver.cruiseOn) {
+      driver.cruiseOn = false;
+      driver.cruiseStatus = 'off';
+      this.showNotice(driver, 'CRUISE OFF');
+    } else if (driver.speed < -0.3) {
+      this.showNotice(driver, 'STOP BEFORE CRUISE');
     } else {
-      this.cruiseOn = true;
-      this.cruiseStatus = 'cruising';
+      driver.cruiseOn = true;
+      driver.cruiseStatus = 'cruising';
     }
   }
 
-  /** Raises (+1) or lowers (−1) the cruise set speed in 5 km/h steps, on or off. */
-  adjustCruise(direction: 1 | -1): void {
-    this.cruiseSetKph = adjustCruise(this.cruiseSetKph, direction);
+  /** Raises (+1) or lowers (−1) a driver's cruise set speed in 5 km/h steps, on or off. */
+  adjustCruise(direction: 1 | -1, playerIndex = 0): void {
+    const driver = this.drivers[playerIndex];
+    if (driver) driver.cruiseSetKph = adjustCruise(driver.cruiseSetKph, direction);
   }
 
   whenReady(): Promise<void> {
     return this.sceneAssetsReady;
   }
 
+  /**
+   * Chooses the cars. Passing `secondDriverCar` makes it a split-screen game
+   * for two players; the player count is fixed once the cars are applied.
+   */
   async setCars(
     driverCar: CarModelId = DEFAULT_CAR_MODEL_ID,
     trafficCount: number = GAME.trafficCount,
     modelCount = 1,
+    secondDriverCar?: CarModelId,
   ): Promise<void> {
-    this.driverCar = driverCar;
+    if (!this.carModelsApplied) {
+      this.drivers[0].carModel = driverCar;
+      if (secondDriverCar && this.drivers.length === 1) {
+        this.addDriver(secondDriverCar);
+        this.resize();
+      }
+    }
     this.setTrafficCount(trafficCount);
-    await this.loadCarModels(driverCar, this.traffic.length === 0 ? 1 : modelCount);
+    if (this.drivers.length > 1 && !this.carModelsApplied) this.reset();
+    await this.loadCarModels(this.traffic.length === 0 ? 1 : modelCount);
   }
 
   dispose(): void {
     cancelAnimationFrame(this.animationFrame);
     window.removeEventListener('resize', this.resize);
-    this.roadsideFences.dispose();
-    this.roadsideScenery.dispose();
-    this.vehicleLights.dispose();
-    this.streetLights.dispose();
-    this.rain.dispose();
-    this.laneMarkings.dispose();
-    this.forest.dispose();
+    for (const driver of this.drivers) {
+      driver.view.dispose();
+      driver.postProcessing?.dispose();
+    }
     this.mountainRange.dispose();
     this.sky.dispose();
     this.sceneryAssets.dispose();
-    this.postProcessing?.dispose();
+    this.groundGeometry.dispose();
     this.textureStore.dispose();
     this.renderer.dispose();
+  }
+
+  private addDriver(carModel: CarModelId): Driver {
+    const index = this.drivers.length;
+    const view = new WorldView({
+      road: this.roadMaterial,
+      shoulder: this.shoulderMaterial,
+      ground: this.groundMaterial,
+      groundGeometry: this.groundGeometry,
+    });
+    this.scene.add(view.root);
+    if (this.look) view.setLook(this.look);
+    if (this.pineTree) view.setTreeModel(this.pineTree);
+    view.forest.setDense(this.denseForest);
+    const driver: Driver = {
+      index,
+      mesh: new THREE.Group(),
+      carModel,
+      camera: new THREE.PerspectiveCamera(BASE_FOV, 1, 0.1, 2400),
+      view,
+      viewport: { x: 0, y: 0, width: 1, height: 1 },
+      distance: 0,
+      speed: 0,
+      lateral: 0,
+      worldX: 0,
+      vehicleHeading: 0,
+      travelHeading: 0,
+      rearWheelsLocked: false,
+      skid: 0,
+      steeringVisual: 0,
+      longitudinalAcceleration: 0,
+      reverseHoldSeconds: 0,
+      facing: 1,
+      viewAlong: 1,
+      odometer: 0,
+      cruiseOn: false,
+      cruiseSetKph: CRUISE_DEFAULT_KPH,
+      cruiseStatus: 'off',
+      notice: { message: '', seconds: 0 },
+      overtakes: 0,
+      assistMessage: 'READY',
+      crashed: false,
+      laps: createLapState(),
+      holdSeconds: 0,
+      ghostSeconds: 0,
+      forward: new THREE.Vector3(),
+      desiredCamera: new THREE.Vector3(),
+      cameraTarget: new THREE.Vector3(),
+      viewDirection: new THREE.Vector3(),
+      lastPosition: new THREE.Vector3(),
+      hasLastPosition: false,
+      snapCamera: true,
+    };
+    this.resetDriver(driver);
+    this.scene.add(driver.mesh);
+    this.drivers.push(driver);
+    for (const car of this.traffic) car.counted.push(false);
+    return driver;
+  }
+
+  private resetDriver(driver: Driver): void {
+    const lateral = laneOffsets[DRIVER_START_LANES[driver.index] ?? 0];
+    driver.distance = 0;
+    driver.speed = 0;
+    driver.lateral = lateral;
+    driver.worldX = roadCenter(0) + Math.cos(roadHeading(0)) * lateral;
+    driver.vehicleHeading = roadHeading(0);
+    driver.travelHeading = driver.vehicleHeading;
+    driver.rearWheelsLocked = false;
+    driver.skid = 0;
+    driver.overtakes = 0;
+    driver.assistMessage = 'READY';
+    driver.reverseHoldSeconds = 0;
+    driver.facing = 1;
+    driver.viewAlong = 1;
+    driver.odometer = 0;
+    driver.cruiseOn = false;
+    driver.cruiseStatus = 'off';
+    driver.notice.seconds = 0;
+    driver.crashed = false;
+    driver.laps = createLapState();
+    driver.holdSeconds = 0;
+    driver.ghostSeconds = 0;
+    driver.snapCamera = true;
+    driver.longitudinalAcceleration = 0;
+    this.vehicleAssets.setBrakeLights(driver.mesh, false);
+    driver.view.reset();
   }
 
   private setupTraffic(): void {
@@ -486,7 +615,8 @@ export class DrivingGame {
         targetSpeed: 0,
         speedChangeTimer: 0,
         direction,
-        counted: false,
+        owner: index % this.drivers.length,
+        counted: this.drivers.map(() => false),
         length: GAME.collisionLength,
         width: GAME.collisionWidth,
       };
@@ -510,29 +640,35 @@ export class DrivingGame {
     }
   }
 
-  private async loadCarModels(driverCar: CarModelId, modelCount: number): Promise<void> {
+  private async loadCarModels(modelCount: number): Promise<void> {
     if (this.carModelsApplied) return;
-    this.carModelsPromise ??= this.vehicleAssets.loadCarModels(driverCar, modelCount);
+    const [first, ...others] = this.drivers.map((driver) => driver.carModel);
+    const trafficIds = selectCarModelIds(first, modelCount);
+    this.carModelsPromise ??= this.vehicleAssets.loadCarModels(first, modelCount, others);
     const available = await this.carModelsPromise;
-    const expectedModelCount = selectCarModelIds(driverCar, modelCount).length;
+    const expectedModelCount = new Set([...trafficIds, ...others]).size;
     if (available.length !== expectedModelCount) {
       throw new Error('One or more selected car models could not be loaded.');
     }
 
-    const playerModel = available.find((model) => model.playerPrototype);
-    if (!playerModel?.playerPrototype) {
-      throw new Error('The selected driver car could not be loaded.');
+    for (const driver of this.drivers) {
+      const model = available.find(({ id }) => id === driver.carModel);
+      if (!model?.playerPrototype) {
+        throw new Error('The selected driver car could not be loaded.');
+      }
+      this.vehicleAssets.replaceVisual(
+        driver.mesh,
+        model.playerPrototype,
+        true,
+        model.id,
+        driver.index === 1 ? SECOND_DRIVER_COLOR : undefined,
+      );
     }
-    this.vehicleAssets.replaceVisual(
-      this.player,
-      playerModel.playerPrototype,
-      true,
-      playerModel.id,
-    );
 
-    const trafficStart = Math.floor(Math.random() * available.length);
+    const trafficModels = available.filter(({ id }) => trafficIds.includes(id));
+    const trafficStart = Math.floor(Math.random() * trafficModels.length);
     this.traffic.forEach((car, index) => {
-      const model = available[(trafficStart + index) % available.length];
+      const model = trafficModels[(trafficStart + index) % trafficModels.length];
       this.vehicleAssets.replaceVisual(car.mesh, model.trafficPrototype, false, model.id);
       const size = this.vehicleAssets.collisionSize(model.id);
       car.length = size.length;
@@ -541,141 +677,81 @@ export class DrivingGame {
     this.carModelsApplied = true;
   }
 
+  private ownerOf(car: TrafficCar): Driver {
+    return this.drivers[car.owner] ?? this.drivers[0];
+  }
+
   /**
-   * Places a car `ahead` units in front of the player along the way the player
+   * Places a car `ahead` units in front of its owner along the way that driver
    * faces (or behind the furthest car going the same way). Slightly more cars
-   * travel with the player, and they drive a little slower so they can be overtaken.
+   * travel with the driver, and they drive a little slower so they can be overtaken.
    */
   private spawnTraffic(car: TrafficCar, ahead?: number, randomizeDirection = false): void {
-    const facing = this.facing;
+    const owner = this.ownerOf(car);
+    const facing = owner.facing;
     if (randomizeDirection) car.direction = Math.random() < 0.56 ? facing : (-facing as 1 | -1);
     const furthest = this.traffic
-      .filter((other) => other !== car && other.direction === car.direction)
+      .filter(
+        (other) => other !== car && other.owner === car.owner && other.direction === car.direction,
+      )
       .reduce(
-        (max, other) => Math.max(max, (other.distance - this.distance) * facing),
+        (max, other) => Math.max(max, (other.distance - owner.distance) * facing),
         TRAFFIC_SPAWN_AHEAD,
       );
-    car.distance = this.distance + facing * (ahead ?? furthest + 48 + Math.random() * 95);
+    car.distance = owner.distance + facing * (ahead ?? furthest + 48 + Math.random() * 95);
     // Traffic keeps left: lanes 0-1 run toward increasing distance, 2-3 the other way.
     car.lane = (car.direction === 1 ? 0 : 2) + (Math.random() < 0.5 ? 0 : 1);
     car.laneOffset = (Math.random() * 2 - 1) * GAME.trafficLaneJitter;
-    // Highway speeds: 80–120 km/h with the player, 90–130 km/h oncoming.
+    // Highway speeds: 80–120 km/h with the driver, 90–130 km/h oncoming.
     car.speed =
       car.direction === facing
         ? fromKph(80 + Math.random() * 40)
         : fromKph(90 + Math.random() * 40);
     car.targetSpeed = car.speed;
     car.speedChangeTimer = 2.5 + Math.random() * 6;
-    car.counted = false;
+    // A car that appears behind another driver can no longer be overtaken by them.
+    car.counted = this.drivers.map(
+      (driver) => driver !== owner && (car.distance - driver.distance) * driver.facing < 0,
+    );
     this.vehicleAssets.setBrakeLights(car.mesh, false);
   }
 
   private updateSimulation(dt: number): void {
-    const control = this.getControl();
-    const { length: collisionLength, width: collisionWidth } = this.vehicleAssets.collisionSize(
-      this.driverCar,
-    );
-
-    this.reverseHoldSeconds = updateReverseHold(this.reverseHoldSeconds, control, this.speed, dt);
-    if (this.cruiseOn && !cruiseStaysEngaged(control)) this.cruiseOn = false;
-    const lead = this.cruiseOn
-      ? findLeadVehicle(this.distance, this.lateral, this.facing, collisionLength, this.traffic)
-      : null;
-    const speedPlan = createSpeedPlan(control, this.speed, {
-      reverseHoldSeconds: this.reverseHoldSeconds,
-      cruiseKph: this.cruiseOn ? this.cruiseSetKph : null,
-      lead,
-    });
-    // A keyboard driver overtaking on the accelerator keeps cruise armed.
-    this.cruiseStatus = this.cruiseOn ? (speedPlan.cruiseStatus ?? 'cruising') : 'off';
-    const { targetSpeed, acceleration, autoBraking } = speedPlan;
-    this.assistMessage = speedPlan.assistMessage;
-    if (this.notice.seconds > 0) {
-      this.notice.seconds -= dt;
-      this.assistMessage = this.notice.message;
+    if (this.countdown > 0) {
+      // Everything waits on the grid until the lights go green.
+      this.countdown -= dt;
+      return;
     }
-    const previousSpeed = this.speed;
-    this.vehicleAssets.setBrakeLights(this.player, autoBraking || speedPlan.braking);
-    // Speed is signed: negative while reversing.
-    this.speed = damp(
-      this.speed,
-      targetSpeed,
-      acceleration / Math.max(8, Math.abs(targetSpeed - this.speed)),
-      dt,
-    );
-    if (targetSpeed === 0 && Math.abs(this.speed) < 0.3) this.speed = 0;
-    this.longitudinalAcceleration = damp(
-      this.longitudinalAcceleration,
-      (this.speed - previousSpeed) / Math.max(dt, 1e-3),
-      5,
-      dt,
-    );
-
-    this.steeringVisual = damp(this.steeringVisual, control.steering, 10, dt);
-    const reversing = this.speed < 0;
-    // The handbrake locks the rear wheels: steering swings the nose round past
-    // the grip limit and the car slides, travelling where it was heading.
-    this.rearWheelsLocked = control.active && control.handbrake === true;
-    const sliding = this.rearWheelsLocked && Math.abs(this.speed) > HANDBRAKE_SLIDE_MIN_SPEED;
-    const yawBoost = sliding ? HANDBRAKE_YAW_BOOST : 1;
-    this.vehicleHeading -= steeringYawRate(this.steeringVisual, this.speed) * yawBoost * dt;
-    this.travelHeading = followTravelHeading(this.travelHeading, this.vehicleHeading, sliding, dt);
-    const slideAngle = Math.abs(
-      Math.atan2(
-        Math.sin(this.vehicleHeading - this.travelHeading),
-        Math.cos(this.vehicleHeading - this.travelHeading),
-      ),
-    );
-    // Locked tyres scrub as long as the car moves; sliding sideways screeches hardest.
-    const skidTarget = sliding
-      ? clamp(toKph(Math.abs(this.speed)) / 45, 0, 1) *
-        (0.55 + 0.45 * clamp(slideAngle / 0.35, 0, 1))
-      : 0;
-    this.skid = damp(this.skid, skidTarget, 12, dt);
-    // Plain planar motion: the car can turn around and drive back down the road.
-    this.worldX += -Math.sin(this.travelHeading) * this.speed * dt;
-    this.distance += Math.cos(this.travelHeading) * this.speed * dt;
-    if (this.speed > 0) this.odometer += this.speed * dt;
-
-    const currentRoadHeading = roadHeading(this.distance);
-    const currentRoadCenter = roadCenter(this.distance);
-    const roadConstraint = constrainToRoad(
-      this.worldX,
-      currentRoadCenter,
-      currentRoadHeading,
-      GAME.roadWidth,
-      GAME.roadEdgeMargin,
-    );
-    this.worldX = roadConstraint.worldX;
-    this.lateral = roadConstraint.lateral;
-    const boundaryLimit = GAME.roadWidth / 2 - GAME.roadEdgeMargin;
-    const edgeProximity = clamp((Math.abs(this.lateral) - (boundaryLimit - 1.6)) / 1.6, 0, 1);
-    if (edgeProximity > 0) {
-      const relativeHeading = Math.atan2(
-        Math.sin(this.vehicleHeading - currentRoadHeading),
-        Math.cos(this.vehicleHeading - currentRoadHeading),
-      );
-      // Sideways drift across the road; positive moves toward positive lateral.
-      const drift = -Math.sin(relativeHeading) * this.speed;
-      if (drift * this.lateral > 0) {
-        // Straighten toward whichever way along the road the nose is nearer,
-        // so a U-turn that reaches the verge completes instead of unwinding.
-        const along =
-          Math.abs(relativeHeading) > Math.PI / 2 ? Math.sign(relativeHeading) * Math.PI : 0;
-        const softenedHeading = damp(relativeHeading, along, 2.5 + edgeProximity * 5.5, dt);
-        this.vehicleHeading = currentRoadHeading + softenedHeading;
-        // The verge ends any slide.
-        this.travelHeading = this.vehicleHeading;
-        const scrub = (2 + edgeProximity * 5) * dt;
-        this.speed = reversing ? Math.min(0, this.speed + scrub) : Math.max(0, this.speed - scrub);
+    if (this.countdown > -1) this.countdown -= dt;
+    this.raceTime += dt;
+    for (const driver of this.drivers) {
+      if (driver.crashed) continue;
+      driver.ghostSeconds = Math.max(0, driver.ghostSeconds - dt);
+      if (driver.holdSeconds > 0) {
+        driver.holdSeconds -= dt;
+        driver.speed = 0;
+        driver.assistMessage = `CRASHED · RESPAWN ${Math.ceil(Math.max(driver.holdSeconds, 0.01))}`;
+        continue;
       }
-      this.assistMessage = 'ROAD EDGE';
-      if (edgeProximity > 0.55) this.vehicleAssets.setBrakeLights(this.player, true);
+      this.stepDriver(driver, dt);
+      this.updateRace(driver);
     }
+    if (this.finishGrace !== null) {
+      this.finishGrace -= dt;
+      for (const driver of this.drivers) {
+        if (driver.laps.finishTime === null && driver.notice.seconds <= 0) {
+          driver.assistMessage = `FINISH IN ${Math.ceil(Math.max(this.finishGrace, 0))}`;
+        }
+      }
+      if (this.finishGrace <= 0) {
+        this.endRace();
+        return;
+      }
+    }
+    // endRace() may have run while drivers stepped.
+    if (this.getPhase() !== 'playing') return;
 
-    this.updateFacing(currentRoadHeading);
-    const facing = this.facing;
-    // Everyone on the road, for traffic to see what is ahead of it; the player is last.
+    // Everyone on the road, for traffic to see what is ahead of it; drivers are last.
     const roadUsers: RoadUser[] = this.traffic.map((car) => ({
       distance: car.distance,
       lateral: laneOffsets[car.lane] + car.laneOffset,
@@ -683,24 +759,28 @@ export class DrivingGame {
       width: car.width,
       velocity: car.speed * car.direction,
     }));
-    roadUsers.push({
-      distance: this.distance,
-      lateral: this.lateral,
-      length: collisionLength,
-      width: collisionWidth,
-      velocity: this.speed * Math.cos(this.travelHeading - currentRoadHeading),
-    });
+    for (const driver of this.drivers) {
+      const size = this.vehicleAssets.collisionSize(driver.carModel);
+      roadUsers.push({
+        distance: driver.distance,
+        lateral: driver.lateral,
+        length: size.length,
+        width: size.width,
+        velocity: driver.speed * Math.cos(driver.travelHeading - roadHeading(driver.distance)),
+      });
+    }
     let trafficIndex = 0;
     for (const car of this.traffic) {
+      const owner = this.ownerOf(car);
       car.speedChangeTimer -= dt;
       if (car.speedChangeTimer <= 0) {
         car.targetSpeed =
-          car.direction === facing
+          car.direction === owner.facing
             ? fromKph(75 + Math.random() * 50)
             : fromKph(85 + Math.random() * 45);
         car.speedChangeTimer = 2.5 + Math.random() * 7;
       }
-      // Traffic brakes for whatever is ahead in its lane, the player included,
+      // Traffic brakes for whatever is ahead in its lane, the drivers included,
       // and stops behind it rather than driving into it.
       const self = roadUsers[trafficIndex];
       const lead = findTrafficLead(self, car.direction, roadUsers);
@@ -711,23 +791,30 @@ export class DrivingGame {
       self.distance = car.distance;
       self.velocity = car.speed * car.direction;
       trafficIndex += 1;
-      const gap = car.distance - this.distance;
-      // How far ahead the car is along the way the player faces.
-      const aheadGap = gap * facing;
-      const laneGap = Math.abs(laneOffsets[car.lane] + car.laneOffset - this.lateral);
-      if (car.direction === facing && !car.counted && aheadGap < -collisionLength) {
-        car.counted = true;
-        this.overtakes += 1;
+
+      for (const driver of this.drivers) {
+        if (driver.crashed || driver.holdSeconds > 0) continue;
+        const size = this.vehicleAssets.collisionSize(driver.carModel);
+        const gap = car.distance - driver.distance;
+        // How far ahead the car is along the way the driver faces.
+        const aheadGap = gap * driver.facing;
+        const laneGap = Math.abs(laneOffsets[car.lane] + car.laneOffset - driver.lateral);
+        if (
+          car.direction === driver.facing &&
+          !car.counted[driver.index] &&
+          aheadGap < -size.length
+        ) {
+          car.counted[driver.index] = true;
+          driver.overtakes += 1;
+        }
+        if (Math.abs(gap) < size.length && laneGap < size.width && !this.passesThrough(driver)) {
+          this.crashDriver(driver);
+        }
       }
-      if (Math.abs(gap) < collisionLength && laneGap < collisionWidth) {
-        this.phase = 'crashed';
-        this.speed = 0;
-        this.vehicleAssets.setBrakeLights(this.player, true);
-        this.assistMessage = 'COLLISION';
-        this.onCrash();
-        break;
-      }
-      if (aheadGap < (car.direction === facing ? -70 : -45)) {
+      if (this.phase === 'crashed') return;
+
+      const ownerGap = (car.distance - this.ownerOf(car).distance) * this.ownerOf(car).facing;
+      if (ownerGap < (car.direction === this.ownerOf(car).facing ? -70 : -45)) {
         this.spawnTraffic(car, undefined, true);
         Object.assign(self, {
           distance: car.distance,
@@ -736,78 +823,225 @@ export class DrivingGame {
         });
       }
     }
+    this.collideDrivers();
+  }
+
+  /** Drives one car for a frame: speed, steering, the road edges and its facing. */
+  private stepDriver(driver: Driver, dt: number): void {
+    const control =
+      driver.laps.finishTime !== null ? FINISHED_CONTROL : this.getControl(driver.index);
+    const { length: collisionLength } = this.vehicleAssets.collisionSize(driver.carModel);
+
+    driver.reverseHoldSeconds = updateReverseHold(
+      driver.reverseHoldSeconds,
+      control,
+      driver.speed,
+      dt,
+    );
+    if (driver.cruiseOn && !cruiseStaysEngaged(control)) driver.cruiseOn = false;
+    const lead = driver.cruiseOn
+      ? findLeadVehicle(
+          driver.distance,
+          driver.lateral,
+          driver.facing,
+          collisionLength,
+          this.cruiseLeadCandidates(driver),
+        )
+      : null;
+    const speedPlan = createSpeedPlan(control, driver.speed, {
+      reverseHoldSeconds: driver.reverseHoldSeconds,
+      cruiseKph: driver.cruiseOn ? driver.cruiseSetKph : null,
+      lead,
+    });
+    // A keyboard driver overtaking on the accelerator keeps cruise armed.
+    driver.cruiseStatus = driver.cruiseOn ? (speedPlan.cruiseStatus ?? 'cruising') : 'off';
+    const { targetSpeed, acceleration, autoBraking } = speedPlan;
+    driver.assistMessage = speedPlan.assistMessage;
+    if (driver.notice.seconds > 0) {
+      driver.notice.seconds -= dt;
+      driver.assistMessage = driver.notice.message;
+    }
+    const previousSpeed = driver.speed;
+    this.vehicleAssets.setBrakeLights(driver.mesh, autoBraking || speedPlan.braking);
+    // Speed is signed: negative while reversing.
+    driver.speed = damp(
+      driver.speed,
+      targetSpeed,
+      acceleration / Math.max(8, Math.abs(targetSpeed - driver.speed)),
+      dt,
+    );
+    if (targetSpeed === 0 && Math.abs(driver.speed) < 0.3) driver.speed = 0;
+    driver.longitudinalAcceleration = damp(
+      driver.longitudinalAcceleration,
+      (driver.speed - previousSpeed) / Math.max(dt, 1e-3),
+      5,
+      dt,
+    );
+
+    driver.steeringVisual = damp(driver.steeringVisual, control.steering, 10, dt);
+    const reversing = driver.speed < 0;
+    // The handbrake locks the rear wheels: steering swings the nose round past
+    // the grip limit and the car slides, travelling where it was heading.
+    driver.rearWheelsLocked = control.active && control.handbrake === true;
+    const sliding = driver.rearWheelsLocked && Math.abs(driver.speed) > HANDBRAKE_SLIDE_MIN_SPEED;
+    const yawBoost = sliding ? HANDBRAKE_YAW_BOOST : 1;
+    driver.vehicleHeading -= steeringYawRate(driver.steeringVisual, driver.speed) * yawBoost * dt;
+    driver.travelHeading = followTravelHeading(
+      driver.travelHeading,
+      driver.vehicleHeading,
+      sliding,
+      dt,
+    );
+    const slideAngle = Math.abs(
+      Math.atan2(
+        Math.sin(driver.vehicleHeading - driver.travelHeading),
+        Math.cos(driver.vehicleHeading - driver.travelHeading),
+      ),
+    );
+    // Locked tyres scrub as long as the car moves; sliding sideways screeches hardest.
+    const skidTarget = sliding
+      ? clamp(toKph(Math.abs(driver.speed)) / 45, 0, 1) *
+        (0.55 + 0.45 * clamp(slideAngle / 0.35, 0, 1))
+      : 0;
+    driver.skid = damp(driver.skid, skidTarget, 12, dt);
+    // Plain planar motion: the car can turn around and drive back down the road.
+    driver.worldX += -Math.sin(driver.travelHeading) * driver.speed * dt;
+    driver.distance += Math.cos(driver.travelHeading) * driver.speed * dt;
+    if (driver.speed > 0) driver.odometer += driver.speed * dt;
+
+    const currentRoadHeading = roadHeading(driver.distance);
+    const currentRoadCenter = roadCenter(driver.distance);
+    const roadConstraint = constrainToRoad(
+      driver.worldX,
+      currentRoadCenter,
+      currentRoadHeading,
+      GAME.roadWidth,
+      GAME.roadEdgeMargin,
+    );
+    driver.worldX = roadConstraint.worldX;
+    driver.lateral = roadConstraint.lateral;
+    const boundaryLimit = GAME.roadWidth / 2 - GAME.roadEdgeMargin;
+    const edgeProximity = clamp((Math.abs(driver.lateral) - (boundaryLimit - 1.6)) / 1.6, 0, 1);
+    if (edgeProximity > 0) {
+      const relativeHeading = Math.atan2(
+        Math.sin(driver.vehicleHeading - currentRoadHeading),
+        Math.cos(driver.vehicleHeading - currentRoadHeading),
+      );
+      // Sideways drift across the road; positive moves toward positive lateral.
+      const drift = -Math.sin(relativeHeading) * driver.speed;
+      if (drift * driver.lateral > 0) {
+        // Straighten toward whichever way along the road the nose is nearer,
+        // so a U-turn that reaches the verge completes instead of unwinding.
+        const along =
+          Math.abs(relativeHeading) > Math.PI / 2 ? Math.sign(relativeHeading) * Math.PI : 0;
+        const softenedHeading = damp(relativeHeading, along, 2.5 + edgeProximity * 5.5, dt);
+        driver.vehicleHeading = currentRoadHeading + softenedHeading;
+        // The verge ends any slide.
+        driver.travelHeading = driver.vehicleHeading;
+        const scrub = (2 + edgeProximity * 5) * dt;
+        driver.speed = reversing
+          ? Math.min(0, driver.speed + scrub)
+          : Math.max(0, driver.speed - scrub);
+      }
+      driver.assistMessage = 'ROAD EDGE';
+      if (edgeProximity > 0.55) this.vehicleAssets.setBrakeLights(driver.mesh, true);
+    }
+
+    this.updateFacing(driver, currentRoadHeading);
+  }
+
+  /** Adaptive cruise follows traffic and the other drivers alike. */
+  private cruiseLeadCandidates(driver: Driver): readonly RadarTarget[] {
+    if (this.drivers.length === 1) return this.traffic;
+    const others = this.drivers
+      .filter((other) => other !== driver)
+      .map((other): RadarTarget => {
+        // Velocity along the road, so a reversing car reads as moving backward.
+        const velocity = other.speed * Math.cos(other.travelHeading - roadHeading(other.distance));
+        return {
+          distance: other.distance,
+          lane: 0,
+          laneOffset: other.lateral - laneOffsets[0],
+          speed: Math.abs(velocity),
+          direction: velocity >= 0 ? 1 : -1,
+        };
+      });
+    return [...this.traffic, ...others];
+  }
+
+  /** Two drivers who touch both end their runs. */
+  private collideDrivers(): void {
+    if (this.drivers.length < 2 || this.phase === 'crashed') return;
+    const [a, b] = this.drivers;
+    if (a.crashed && b.crashed) return;
+    if (this.passesThrough(a) || this.passesThrough(b)) return;
+    const sizeA = this.vehicleAssets.collisionSize(a.carModel);
+    const sizeB = this.vehicleAssets.collisionSize(b.carModel);
+    const gap = Math.abs(a.distance - b.distance);
+    const laneGap = Math.abs(a.lateral - b.lateral);
+    if (gap < (sizeA.length + sizeB.length) / 2 && laneGap < (sizeA.width + sizeB.width) / 2) {
+      if (!a.crashed) this.crashDriver(a);
+      if (!b.crashed) this.crashDriver(b);
+    }
+  }
+
+  /**
+   * Ends one driver's run. The wrecked car stays on the road for traffic to
+   * stop behind; the run ends once every driver has crashed.
+   */
+  private crashDriver(driver: Driver): void {
+    if (this.lapLength !== null) {
+      this.respawnDriver(driver);
+      return;
+    }
+    driver.crashed = true;
+    driver.speed = 0;
+    driver.skid = 0;
+    driver.cruiseOn = false;
+    driver.cruiseStatus = 'off';
+    this.vehicleAssets.setBrakeLights(driver.mesh, true);
+    driver.assistMessage = 'COLLISION';
+    const survivor = this.drivers.find((other) => !other.crashed);
+    if (survivor) {
+      // The wreck's traffic now queues around whoever is still driving.
+      for (const car of this.traffic) {
+        if (car.owner === driver.index) car.owner = survivor.index;
+      }
+      return;
+    }
+    this.phase = 'crashed';
+    this.onCrash();
   }
 
   /**
    * Flips which way traffic treats as ahead once the car has clearly turned
    * around. Cars already behind in the new direction cannot count as overtakes.
    */
-  private updateFacing(currentRoadHeading: number): void {
-    const along = Math.cos(this.vehicleHeading - currentRoadHeading);
+  private updateFacing(driver: Driver, currentRoadHeading: number): void {
+    const along = Math.cos(driver.vehicleHeading - currentRoadHeading);
     const flipped =
-      (this.facing === 1 && along < -FACING_HYSTERESIS) ||
-      (this.facing === -1 && along > FACING_HYSTERESIS);
+      (driver.facing === 1 && along < -FACING_HYSTERESIS) ||
+      (driver.facing === -1 && along > FACING_HYSTERESIS);
     if (!flipped) return;
-    this.facing = this.facing === 1 ? -1 : 1;
+    driver.facing = driver.facing === 1 ? -1 : 1;
     for (const car of this.traffic) {
-      car.counted = (car.distance - this.distance) * this.facing < 0;
+      car.counted[driver.index] = (car.distance - driver.distance) * driver.facing < 0;
     }
   }
 
-  private updateWorld(dt: number, rainSeconds: number): void {
-    // Scenery follows the way the camera looks, so a U-turn finds road ahead.
-    this.camera.getWorldDirection(this.viewDirection);
-    const viewHeading = roadHeading(this.distance);
-    const viewLength = Math.hypot(this.viewDirection.x, this.viewDirection.z);
-    if (viewLength > 1e-3) {
-      this.viewAlong =
-        (-Math.sin(viewHeading) * this.viewDirection.x -
-          Math.cos(viewHeading) * this.viewDirection.z) /
-        viewLength;
-    }
-    const viewAlong = this.viewAlong;
-    this.roadUpdateElapsed += dt;
-    const roadJumped =
-      !Number.isFinite(this.lastRoadUpdateDistance) ||
-      Math.abs(this.distance - this.lastRoadUpdateDistance) > 5;
-    if (roadJumped || this.roadUpdateElapsed >= ROAD_UPDATE_INTERVAL) {
-      const length = GAME.lookAhead + GAME.lookBehind + 150;
-      const start = roadWindowStart(this.distance, viewAlong, length, GAME.lookBehind);
-      updateRoadStrip(this.shoulderGeometry, start, length);
-      updateRoadStrip(this.roadGeometry, start, length);
-      this.laneMarkings.update(start, length);
-      this.lastRoadUpdateDistance = this.distance;
-      this.roadUpdateElapsed = 0;
-    }
-    this.roadsideFences.update(this.distance, viewAlong);
+  private updateWorld(dt: number): void {
+    for (const driver of this.drivers) this.updateDriverView(driver, dt);
 
-    const centerX = roadCenter(this.distance);
-    this.player.position.set(this.worldX, 0.02, -this.distance);
-    this.player.rotation.y = this.vehicleHeading;
-    // Body roll leans away from the turn and pitch follows braking/acceleration;
-    // both act on the sprung body only so the tyres stay on the road.
-    const lateralLoad =
-      this.steeringVisual * clamp(Math.abs(this.speed) / 30, 0, 1) * Math.sign(this.speed);
-    this.vehicleAssets.updateSuspension(
-      this.player,
-      lateralLoad * 0.04,
-      this.longitudinalAcceleration * 0.0024,
-      dt,
-    );
-    this.vehicleAssets.updateWheelAnimation(
-      this.player,
-      this.speed * dt,
-      this.steeringVisual,
-      dt,
-      this.rearWheelsLocked,
-    );
-
+    // Traffic is placed once for every view; each view then shows what it can see.
     for (const car of this.traffic) {
-      const gap = car.distance - this.distance;
-      const aheadGap = gap * this.facing;
-      const visible = aheadGap > -90 && aheadGap < GAME.lookAhead + 80;
-      car.mesh.visible = visible;
-      if (!visible) continue;
+      let nearest = Number.POSITIVE_INFINITY;
+      let inAnyView = false;
+      for (const driver of this.drivers) {
+        const gap = car.distance - driver.distance;
+        nearest = Math.min(nearest, Math.abs(gap));
+        if (this.inView(driver, car)) inAnyView = true;
+      }
+      if (!inAnyView) continue;
       const carHeading = roadHeading(car.distance);
       const offset = laneOffsets[car.lane] + car.laneOffset;
       car.mesh.position.set(
@@ -816,108 +1050,269 @@ export class DrivingGame {
         -car.distance - Math.sin(carHeading) * offset,
       );
       car.mesh.rotation.y = carHeading + (car.direction === -1 ? Math.PI : 0);
-      const detailDistance = Math.abs(gap);
-      this.vehicleAssets.setDetail(car.mesh, detailDistance);
-      this.vehicleAssets.setShadowCasting(car.mesh, detailDistance < 65);
-      if (detailDistance < 70) {
+      if (nearest < 70) {
         this.vehicleAssets.updateWheelAnimation(car.mesh, car.speed * dt, 0, dt);
       }
     }
+  }
 
-    this.roadsideScenery.update(this.distance, viewAlong);
+  private inView(driver: Driver, car: TrafficCar): boolean {
+    const aheadGap = (car.distance - driver.distance) * driver.facing;
+    return aheadGap > -90 && aheadGap < GAME.lookAhead + 80;
+  }
 
-    this.ground.position.set(centerX, -0.09, -this.distance - 180 * viewAlong);
-    const groundMaterial = this.ground.material as THREE.MeshStandardMaterial;
-    // PlaneGeometry's V axis points toward negative world Z after the ground is
-    // rotated flat. Offset from the plane's world position so recentering the
-    // large ground mesh never makes its texture travel with the player.
-    const grassOffsetX = this.ground.position.x / GRASS_TILE_METERS;
-    const grassOffsetY = -this.ground.position.z / GRASS_TILE_METERS;
-    groundMaterial.map?.offset.set(grassOffsetX, grassOffsetY);
-    groundMaterial.normalMap?.offset.set(grassOffsetX, grassOffsetY);
-    groundMaterial.roughnessMap?.offset.set(grassOffsetX, grassOffsetY);
-    groundMaterial.metalnessMap?.offset.set(grassOffsetX, grassOffsetY);
+  /** Poses one driver's car and chase camera, and recycles their scenery. */
+  private updateDriverView(driver: Driver, dt: number): void {
+    // Scenery follows the way the camera looks, so a U-turn finds road ahead.
+    const { camera } = driver;
+    camera.getWorldDirection(driver.viewDirection);
+    const viewHeading = roadHeading(driver.distance);
+    const viewLength = Math.hypot(driver.viewDirection.x, driver.viewDirection.z);
+    if (viewLength > 1e-3) {
+      driver.viewAlong =
+        (-Math.sin(viewHeading) * driver.viewDirection.x -
+          Math.cos(viewHeading) * driver.viewDirection.z) /
+        viewLength;
+    }
+    driver.view.update(driver.distance, driver.viewAlong, dt);
+
+    const { mesh } = driver;
+    mesh.position.set(driver.worldX, 0.02, -driver.distance);
+    mesh.rotation.y = driver.vehicleHeading;
+    // Body roll leans away from the turn and pitch follows braking/acceleration;
+    // both act on the sprung body only so the tyres stay on the road.
+    const lateralLoad =
+      driver.steeringVisual * clamp(Math.abs(driver.speed) / 30, 0, 1) * Math.sign(driver.speed);
+    this.vehicleAssets.updateSuspension(
+      mesh,
+      lateralLoad * 0.04,
+      driver.longitudinalAcceleration * 0.0024,
+      dt,
+    );
+    this.vehicleAssets.updateWheelAnimation(
+      mesh,
+      driver.speed * dt,
+      driver.steeringVisual,
+      dt,
+      driver.rearWheelsLocked,
+    );
+
     // The camera follows the direction of travel, so a handbrake slide shows
     // the car turned across its path rather than the road swinging round.
-    this.forward.set(-Math.sin(this.travelHeading), 0, -Math.cos(this.travelHeading));
-    this.shadowCenter.copy(this.player.position).addScaledVector(this.forward, 32);
-    updateSceneShadow(this.lighting, this.shadowCenter);
+    driver.forward.set(-Math.sin(driver.travelHeading), 0, -Math.cos(driver.travelHeading));
     // Carry the camera with the car so it never trails further behind at
     // speed; the lerp below only smooths turns and the speed pull-back.
-    if (this.hasLastPlayerPosition) {
-      const moved = this.player.position.distanceTo(this.lastPlayerPosition);
+    if (driver.hasLastPosition) {
+      const moved = mesh.position.distanceTo(driver.lastPosition);
       if (moved < 40) {
-        this.camera.position.add(this.lastPlayerPosition.sub(this.player.position).negate());
+        camera.position.add(driver.lastPosition.sub(mesh.position).negate());
       }
     }
-    this.lastPlayerPosition.copy(this.player.position);
-    this.hasLastPlayerPosition = true;
-    const speedFraction = clamp(Math.abs(this.speed) / GAME.maxSpeed, 0, 1);
-    this.desiredCamera
-      .copy(this.player.position)
-      .addScaledVector(this.forward, -(CAMERA_DISTANCE + CAMERA_SPEED_PULLBACK * speedFraction));
-    this.desiredCamera.y += 4.3;
-    this.camera.position.lerp(this.desiredCamera, 1 - Math.exp(-5 * dt));
-    this.cameraTarget.copy(this.player.position).addScaledVector(this.forward, 12);
+    driver.lastPosition.copy(mesh.position);
+    driver.hasLastPosition = true;
+    const speedFraction = clamp(Math.abs(driver.speed) / GAME.maxSpeed, 0, 1);
+    driver.desiredCamera
+      .copy(mesh.position)
+      .addScaledVector(driver.forward, -(CAMERA_DISTANCE + CAMERA_SPEED_PULLBACK * speedFraction));
+    driver.desiredCamera.y += 4.3;
+    if (driver.snapCamera) {
+      camera.position.copy(driver.desiredCamera);
+      driver.snapCamera = false;
+    } else {
+      camera.position.lerp(driver.desiredCamera, 1 - Math.exp(-5 * dt));
+    }
+    driver.cameraTarget.copy(mesh.position).addScaledVector(driver.forward, 12);
     // A faint high-frequency judder from the road surface grows with speed.
     const time = performance.now() * 0.001;
     const judder = Math.sin(time * 37) * 0.6 + Math.sin(time * 23.7 + 1.3) * 0.4;
-    this.cameraTarget.y += 1 + judder * CAMERA_SHAKE * speedFraction * speedFraction;
-    this.camera.lookAt(this.cameraTarget);
+    driver.cameraTarget.y += 1 + judder * CAMERA_SHAKE * speedFraction * speedFraction;
+    camera.lookAt(driver.cameraTarget);
     // Widen the lens with speed for a stronger sense of velocity.
-    const fov = BASE_FOV + SPEED_FOV_BOOST * clamp(this.speed / GAME.maxSpeed, 0, 1) ** 1.5;
-    if (Math.abs(this.camera.fov - fov) > 0.01) {
-      this.camera.fov = damp(this.camera.fov, fov, 3, dt);
-      this.camera.updateProjectionMatrix();
+    const baseFov = this.drivers.length > 1 ? SPLIT_BASE_FOV : BASE_FOV;
+    const fov = baseFov + SPEED_FOV_BOOST * clamp(driver.speed / GAME.maxSpeed, 0, 1) ** 1.5;
+    if (Math.abs(camera.fov - fov) > 0.01) {
+      camera.fov = damp(camera.fov, fov, 3, dt);
+      camera.updateProjectionMatrix();
     }
-
-    this.sky.update(this.camera, performance.now() * 0.001);
-    this.mountainRange.update(this.camera.position);
-    this.forest.update(this.distance, viewAlong);
-    this.rain.update(this.camera, rainSeconds, this.vehicleLights.headlight);
-    this.updateVehicleLights();
   }
 
-  private showNotice(message: string): void {
-    this.notice.message = message;
-    this.notice.seconds = 1.6;
+  /**
+   * Readies the shared scene to be drawn from one driver's camera: only their
+   * world view shows, and the sky, sun shadow, rain and lamps follow them.
+   */
+  private prepareView(driver: Driver, rainSeconds: number): void {
+    for (const other of this.drivers) other.view.root.visible = other === driver;
+    for (const car of this.traffic) {
+      const visible = this.inView(driver, car);
+      car.mesh.visible = visible;
+      if (!visible) continue;
+      const detailDistance = Math.abs(car.distance - driver.distance);
+      this.vehicleAssets.setDetail(car.mesh, detailDistance);
+      this.vehicleAssets.setShadowCasting(car.mesh, detailDistance < 65);
+    }
+    this.shadowCenter.copy(driver.mesh.position).addScaledVector(driver.forward, 32);
+    updateSceneShadow(this.lighting, this.shadowCenter);
+    this.sky.update(driver.camera, performance.now() * 0.001);
+    this.mountainRange.update(driver.camera.position);
+    driver.view.rain.update(driver.camera, rainSeconds, driver.view.vehicleLights.headlight);
+    driver.view.applyGroundOffset();
+    this.updateVehicleLights(driver);
   }
 
-  private updateVehicleLights(): void {
+  private showNotice(driver: Driver, message: string, seconds = 1.6): void {
+    driver.notice.message = message;
+    driver.notice.seconds = seconds;
+  }
+
+  /** Cars just respawned or already finished drive through others. */
+  private passesThrough(driver: Driver): boolean {
+    return driver.ghostSeconds > 0 || driver.holdSeconds > 0 || driver.laps.finishTime !== null;
+  }
+
+  /**
+   * In a race a crash costs time instead of ending the run: the car goes
+   * back to its own lane facing the right way, waits, then drives on as a
+   * ghost for a moment so the car it hit can get clear.
+   */
+  private respawnDriver(driver: Driver): void {
+    const lateral = laneOffsets[DRIVER_START_LANES[driver.index] ?? 0];
+    const heading = roadHeading(driver.distance);
+    driver.speed = 0;
+    driver.skid = 0;
+    driver.lateral = lateral;
+    driver.worldX = roadCenter(driver.distance) + Math.cos(heading) * lateral;
+    driver.vehicleHeading = heading;
+    driver.travelHeading = heading;
+    driver.steeringVisual = 0;
+    driver.reverseHoldSeconds = 0;
+    driver.longitudinalAcceleration = 0;
+    driver.cruiseOn = false;
+    driver.cruiseStatus = 'off';
+    if (driver.facing === -1) {
+      driver.facing = 1;
+      for (const car of this.traffic) {
+        car.counted[driver.index] = car.distance < driver.distance;
+      }
+    }
+    driver.snapCamera = true;
+    driver.holdSeconds = RESPAWN_HOLD_SECONDS;
+    driver.ghostSeconds = RESPAWN_HOLD_SECONDS + RESPAWN_GHOST_SECONDS;
+    this.vehicleAssets.setBrakeLights(driver.mesh, true);
+  }
+
+  /** Everyone has finished, or time ran out for those still racing. */
+  private endRace(): void {
+    this.phase = 'finished';
+    this.finishGrace = null;
+    for (const driver of this.drivers) driver.skid = 0;
+    this.onRaceFinish(this.snapshots());
+  }
+
+  /** Counts finish lines crossed and announces each lap and the flag. */
+  private updateRace(driver: Driver): void {
+    if (this.lapLength === null) return;
+    const { laps } = driver;
+    const event = updateLaps(laps, driver.distance, this.lapLength, this.totalLaps, this.raceTime);
+    if (event === 'lap') {
+      const label =
+        laps.lapsDone + 1 === this.totalLaps
+          ? 'FINAL LAP'
+          : `LAP ${laps.lapsDone + 1}/${this.totalLaps}`;
+      this.showNotice(driver, `${label} · ${formatLapTime(laps.lastLap)}`, 3);
+    } else if (event === 'finish') {
+      this.showNotice(driver, `FINISHED · ${formatLapTime(laps.finishTime)}`, 3);
+      driver.cruiseOn = false;
+      driver.cruiseStatus = 'off';
+      if (this.drivers.every((other) => other.laps.finishTime !== null)) this.endRace();
+      else this.finishGrace ??= RACE_FINISH_GRACE_SECONDS;
+    }
+    if (laps.finishTime !== null && driver.notice.seconds <= 0) {
+      driver.assistMessage = `FINISHED · ${formatLapTime(laps.finishTime)}`;
+    }
+  }
+
+  private raceSnapshot(driver: Driver, position: number): RaceSnapshot | null {
+    if (this.lapLength === null) return null;
+    const { laps } = driver;
+    const finished = laps.finishTime !== null;
+    const totalTime = laps.finishTime ?? this.raceTime;
+    return {
+      lap: Math.min(laps.lapsDone + 1, this.totalLaps),
+      laps: this.totalLaps,
+      lapTime: finished ? totalTime : this.raceTime - laps.lapStart,
+      lastLap: laps.lastLap,
+      bestLap: laps.bestLap,
+      totalTime,
+      position,
+      finished,
+      countdown: Number.isFinite(this.countdown) ? Math.max(this.countdown, -1) : -1,
+      roadDistance: driver.distance,
+    };
+  }
+
+  private updateVehicleLights(driver: Driver): void {
     const bufferHeight = this.renderer.getDrawingBufferSize(this.drawingBufferSize).y;
-    this.streetLights.update(
-      this.distance,
-      this.viewAlong,
-      this.camera,
+    const { vehicleLights, streetLights } = driver.view;
+    streetLights.update(
+      driver.distance,
+      driver.viewAlong,
+      driver.camera,
       bufferHeight,
-      this.player.position,
+      driver.mesh.position,
     );
-    if (!this.vehicleLights.beginFrame(this.camera, bufferHeight)) return;
-    const playerRig = this.vehicleAssets.lightRig(this.player);
-    if (playerRig) this.vehicleLights.placeHeadlight(this.player, playerRig);
+    if (!vehicleLights.beginFrame(driver.camera, bufferHeight)) return;
+    const playerRig = this.vehicleAssets.lightRig(driver.mesh);
+    if (playerRig) vehicleLights.placeHeadlight(driver.mesh, playerRig);
+    for (const other of this.drivers) {
+      if (other === driver) continue;
+      const rig = this.vehicleAssets.lightRig(other.mesh);
+      if (rig) vehicleLights.addVehicle(other.mesh, rig, this.vehicleAssets.isBraking(other.mesh));
+    }
     for (const car of this.traffic) {
       if (!car.mesh.visible) continue;
       const rig = this.vehicleAssets.lightRig(car.mesh);
       if (!rig) continue;
-      this.vehicleLights.addVehicle(car.mesh, rig, this.vehicleAssets.isBraking(car.mesh));
+      vehicleLights.addVehicle(car.mesh, rig, this.vehicleAssets.isBraking(car.mesh));
     }
-    this.vehicleLights.endFrame();
+    vehicleLights.endFrame();
   }
 
   private applyWetness(wetness: number): void {
     const surfaces = [
-      [this.roadMesh, SURFACE_WETNESS.road],
-      [this.shoulderMesh, SURFACE_WETNESS.shoulder],
-      [this.ground, SURFACE_WETNESS.ground],
+      [this.roadMaterial, SURFACE_WETNESS.road],
+      [this.shoulderMaterial, SURFACE_WETNESS.shoulder],
+      [this.groundMaterial, SURFACE_WETNESS.ground],
     ] as const;
-    for (const [mesh, response] of surfaces) {
-      const material = mesh.material as THREE.MeshStandardMaterial;
+    for (const [material, response] of surfaces) {
       const mix = (range: readonly [number, number]): number =>
         THREE.MathUtils.lerp(range[0], range[1], wetness);
       material.roughness = mix(response.roughness);
       material.color.setScalar(mix(response.brightness));
       material.envMapIntensity = mix(response.reflection);
     }
+  }
+
+  private renderViews(dt: number, rainSeconds: number): void {
+    const usePostProcessing = this.adaptiveQuality.settings.postProcessing;
+    if (this.drivers.length === 1) {
+      const [driver] = this.drivers;
+      this.prepareView(driver, rainSeconds);
+      if (driver.postProcessing && usePostProcessing) driver.postProcessing.render(dt);
+      else this.renderer.render(this.scene, driver.camera);
+      return;
+    }
+    // Split screen: each driver draws into their own part of the canvas.
+    this.renderer.setScissorTest(true);
+    for (const driver of this.drivers) {
+      this.prepareView(driver, rainSeconds);
+      const { x, y, width, height } = driver.viewport;
+      this.renderer.setViewport(x, y, width, height);
+      this.renderer.setScissor(x, y, width, height);
+      if (driver.postProcessing && usePostProcessing) driver.postProcessing.render(dt);
+      else this.renderer.render(this.scene, driver.camera);
+    }
+    this.renderer.setScissorTest(false);
+    this.renderer.setViewport(0, 0, this.container.clientWidth, this.container.clientHeight);
   }
 
   private animate = (): void => {
@@ -928,8 +1323,7 @@ export class DrivingGame {
     const playing = this.phase === 'playing';
     if (!playing && now - this.lastIdleRender < IDLE_RENDER_INTERVAL_MS) return;
     if (playing) this.updateSimulation(dt);
-    // Rain keeps real time on menus, where the world only repaints a few times a second.
-    this.updateWorld(dt, Math.min(frameSeconds, 0.25));
+    this.updateWorld(dt);
     let qualitySettings = this.pendingRenderQuality;
     this.pendingRenderQuality = undefined;
     if (playing && this.graphicsQualityMode === 'auto') {
@@ -940,11 +1334,8 @@ export class DrivingGame {
     this.renderer.info.reset();
     // Quality changes resize and clear the WebGL drawing buffer. Rendering
     // afterward fills it in the same animation frame and prevents a black flash.
-    if (this.postProcessing && this.adaptiveQuality.settings.postProcessing) {
-      this.postProcessing.render(dt);
-    } else {
-      this.renderer.render(this.scene, this.camera);
-    }
+    // Rain keeps real time on menus, where the world only repaints a few times a second.
+    this.renderViews(dt, Math.min(frameSeconds, 0.25));
     if (this.performanceMonitoring && playing) {
       const render = this.renderer.info.render;
       const memory = this.renderer.info.memory;
@@ -964,35 +1355,62 @@ export class DrivingGame {
 
     if (now - this.lastSnapshot > 80) {
       this.lastSnapshot = now;
-      this.onUpdate({
-        speedKph: toKph(Math.abs(this.speed)),
-        distance: toMeters(this.odometer),
-        overtakes: this.overtakes,
-        score: Math.floor(toMeters(this.odometer) + this.overtakes * 250),
-        cruise: { status: this.cruiseStatus, setKph: this.cruiseSetKph },
-        phase: this.phase,
-        assistMessage: this.assistMessage,
-        skid: this.phase === 'playing' ? this.skid : 0,
-      });
+      this.onUpdate(this.snapshots());
     }
   };
+
+  private snapshots(): GameSnapshot[] {
+    const positions = racePositions(
+      this.drivers.map((driver) => ({
+        distance: driver.distance,
+        finishTime: driver.laps.finishTime,
+        crashed: driver.crashed,
+      })),
+    );
+    return this.drivers.map((driver) => this.snapshot(driver, positions[driver.index]));
+  }
+
+  private snapshot(driver: Driver, position: number): GameSnapshot {
+    return {
+      speedKph: toKph(Math.abs(driver.speed)),
+      distance: toMeters(driver.odometer),
+      overtakes: driver.overtakes,
+      score: Math.floor(toMeters(driver.odometer) + driver.overtakes * 250),
+      cruise: { status: driver.cruiseStatus, setKph: driver.cruiseSetKph },
+      phase: driver.crashed ? 'crashed' : this.phase,
+      assistMessage: driver.assistMessage,
+      skid: this.phase === 'playing' && !driver.crashed ? driver.skid : 0,
+      race: this.raceSnapshot(driver, position),
+    };
+  }
 
   private resize = (): void => {
     const width = this.container.clientWidth;
     const height = this.container.clientHeight;
-    this.camera.aspect = width / Math.max(height, 1);
-    this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
-    this.postProcessing?.syncSize(width, height);
+    // Split screen sits side by side, matching where the two players sit.
+    const count = this.drivers.length;
+    this.drivers.forEach((driver, index) => {
+      const left = Math.round((width * index) / count);
+      const right = Math.round((width * (index + 1)) / count);
+      driver.viewport = { x: left, y: 0, width: right - left, height };
+      driver.camera.aspect = (right - left) / Math.max(height, 1);
+      driver.camera.updateProjectionMatrix();
+      driver.postProcessing?.syncSize(right - left, height);
+    });
   };
 
   private applyRenderQuality(settings: RenderQualitySettings): void {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, settings.pixelRatioCap));
-    this.forest.setDense(settings.denseForest);
-    if (settings.postProcessing) {
-      this.postProcessing ??= new PostProcessing(this.renderer, this.scene, this.camera);
-      this.postProcessing.syncSize(this.container.clientWidth, this.container.clientHeight);
+    this.denseForest = settings.denseForest;
+    for (const driver of this.drivers) {
+      driver.view.forest.setDense(settings.denseForest);
+      if (settings.postProcessing) {
+        driver.postProcessing ??= new PostProcessing(this.renderer, this.scene, driver.camera);
+      }
     }
+    // Pixel ratio changes resize the drawing buffer and every effect target.
+    this.resize();
     const shadow = this.lighting.sun.shadow;
     if (shadow.mapSize.x !== settings.shadowMapSize) {
       shadow.mapSize.set(settings.shadowMapSize, settings.shadowMapSize);

@@ -1,5 +1,6 @@
 import { MAX_SPEED_KPH } from '../game/config';
-import type { CruiseStatus, GameSnapshot } from '../game/types';
+import { formatLapTime } from '../game/simulation/raceLaps';
+import type { CruiseStatus, GameSnapshot, RaceSnapshot } from '../game/types';
 import { byId } from './dom';
 
 const CRUISE_LABELS: Record<CruiseStatus, string> = {
@@ -8,6 +9,12 @@ const CRUISE_LABELS: Record<CruiseStatus, string> = {
   following: 'FOLLOWING',
   braking: 'BRAKING',
 };
+
+/** 1ST, 2ND, 3RD, 4TH… */
+export function ordinalSuffix(position: number): string {
+  if (position % 100 >= 11 && position % 100 <= 13) return 'TH';
+  return ['TH', 'ST', 'ND', 'RD'][position % 10] ?? 'TH';
+}
 
 /** Updates the in-run HUD without exposing its DOM structure to the game loop. */
 export class GameHud {
@@ -23,6 +30,12 @@ export class GameHud {
   private readonly cruiseToggle = byId<HTMLButtonElement>('cruise-toggle');
   private readonly cruiseStatus = byId<HTMLElement>('cruise-status');
   private readonly cruiseSpeed = byId<HTMLElement>('cruise-speed');
+  private readonly runStats = byId<HTMLElement>('run-stats');
+  private readonly racePosition = byId<HTMLElement>('race-position');
+  private readonly raceLap = byId<HTMLElement>('race-lap');
+  private readonly raceTimeLabel = byId<HTMLElement>('race-time-label');
+  private readonly raceTime = byId<HTMLElement>('race-time');
+  private readonly raceBest = byId<HTMLElement>('race-best');
   private cruiseState = '';
 
   show(): void {
@@ -37,6 +50,7 @@ export class GameHud {
     this.score.textContent = snapshot.score.toString().padStart(6, '0');
     this.assist.textContent = snapshot.assistMessage;
     this.steering.style.left = `${50 + steering * 46}%`;
+    this.updateRace(snapshot.race);
     const { status, setKph } = snapshot.cruise;
     const cruiseState = `${status}:${setKph}`;
     if (cruiseState !== this.cruiseState) {
@@ -46,5 +60,15 @@ export class GameHud {
       this.cruiseStatus.textContent = CRUISE_LABELS[status];
       this.cruiseSpeed.textContent = setKph.toString();
     }
+  }
+
+  private updateRace(race: RaceSnapshot | null): void {
+    this.runStats.classList.toggle('is-race', race !== null);
+    if (!race) return;
+    this.racePosition.innerHTML = `${race.position}<small>${ordinalSuffix(race.position)}</small>`;
+    this.raceLap.innerHTML = `${race.lap}<small>/${race.laps}</small>`;
+    this.raceTimeLabel.textContent = race.finished ? 'TOTAL TIME' : 'LAP TIME';
+    this.raceTime.textContent = formatLapTime(race.lapTime);
+    this.raceBest.textContent = formatLapTime(race.bestLap);
   }
 }

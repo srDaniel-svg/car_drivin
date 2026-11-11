@@ -610,9 +610,20 @@ export class VehicleAssets {
     suspension.body.rotation.set(suspension.pitch, 0, suspension.roll);
   }
 
-  async loadCarModels(playerModelId: CarModelId, modelCount = 1): Promise<LoadedCarModel[]> {
+  /**
+   * Loads the driver's car, `modelCount` models for traffic starting from it,
+   * and any `extraPlayerModelIds` (other split-screen drivers' cars).
+   */
+  async loadCarModels(
+    playerModelId: CarModelId,
+    modelCount = 1,
+    extraPlayerModelIds: readonly CarModelId[] = [],
+  ): Promise<LoadedCarModel[]> {
     const loader = new GLTFLoader();
-    const selectedIds = selectCarModelIds(playerModelId, modelCount);
+    const playerIds = new Set<CarModelId>([playerModelId, ...extraPlayerModelIds]);
+    const selectedIds = [
+      ...new Set([...selectCarModelIds(playerModelId, modelCount), ...extraPlayerModelIds]),
+    ];
     const selectedSpecs = selectedIds.map((id) => {
       const spec = CAR_MODEL_SPECS.find((candidate) => candidate.id === id);
       if (!spec) throw new Error(`Missing specification for car model: ${id}`);
@@ -629,7 +640,7 @@ export class VehicleAssets {
           return {
             id: spec.id,
             trafficPrototype,
-            playerPrototype: spec.id === playerModelId ? trafficPrototype : undefined,
+            playerPrototype: playerIds.has(spec.id as CarModelId) ? trafficPrototype : undefined,
           };
         } catch (error) {
           console.error(`Could not load the ${spec.id} car model.`, error);
@@ -646,6 +657,7 @@ export class VehicleAssets {
     prototype: THREE.Group,
     player: boolean,
     modelId: VehicleModelId,
+    paintColor?: number,
   ): void {
     const oldGeometries = new Set<THREE.BufferGeometry>();
     const oldMaterials = new Set<THREE.Material>();
@@ -663,7 +675,7 @@ export class VehicleAssets {
 
     const instance = prototype.clone(true);
     const modelSpec = CAR_MODEL_SPECS.find((spec) => spec.id === modelId);
-    const color = player ? DRIVER_CAR_COLOR : this.randomColor();
+    const color = paintColor ?? (player ? DRIVER_CAR_COLOR : this.randomColor());
     this.applyCarColor(instance, modelId, color, player);
     const modelBrakeLights = this.prepareModelBrakeLights(instance, modelId);
     car.add(instance);

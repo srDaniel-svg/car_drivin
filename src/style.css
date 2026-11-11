@@ -562,8 +562,11 @@ h2 {
   gap: 8px;
   margin: -10px 0 8px;
 }
-.car-options label:first-child {
+.car-options .second-driver-option {
   grid-column: 1 / -1;
+}
+.car-options .second-driver-option.is-hidden {
+  display: none;
 }
 .car-options label {
   display: grid;
@@ -1109,6 +1112,20 @@ h2 {
   background: var(--panel);
   border-top: 1px solid var(--line);
   backdrop-filter: blur(10px);
+}
+.run-stats .race-stat,
+.run-stats.is-race .free-stat,
+.split-stats .race-stat,
+.split-panel.is-race .split-stats .free-stat {
+  display: none;
+}
+.run-stats.is-race .race-stat,
+.split-panel.is-race .split-stats .race-stat {
+  display: block;
+}
+/* Race stats fill the top row, so race notices sit beneath them. */
+.run-stats.is-race ~ .assist {
+  top: 156px;
 }
 .run-stats div:first-child {
   padding-left: 14px;
@@ -1763,5 +1780,531 @@ h2 {
   }
   .camera-shell {
     right: 20px;
+  }
+}
+
+/* Two-player split screen ------------------------------------------------ */
+.split-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 0 0 12px;
+  color: rgba(255, 255, 255, 0.6);
+  font:
+    500 8px 'DM Mono',
+    monospace;
+  letter-spacing: 0.04em;
+}
+.split-note.is-hidden {
+  display: none;
+}
+.split-note i {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 1px solid var(--acid);
+  color: var(--acid);
+  font-style: normal;
+}
+.split-hud {
+  position: absolute;
+  z-index: 8;
+  inset: 0;
+  pointer-events: none;
+}
+.split-hud.is-hidden {
+  display: none;
+}
+.split-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+  background: var(--ink);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+.split-panel {
+  --player: var(--acid);
+  position: absolute;
+  bottom: 22px;
+  width: min(236px, calc(50vw - 40px));
+  padding: 10px 13px 12px;
+  background: var(--panel);
+  border-top: 2px solid var(--player);
+  backdrop-filter: blur(10px);
+}
+.split-panel[data-player='1'] {
+  left: 20px;
+}
+.split-panel[data-player='2'] {
+  --player: #6f9bff;
+  right: 20px;
+}
+.split-tag {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  color: var(--player);
+  font:
+    600 13px 'DM Mono',
+    monospace;
+}
+.split-speed b {
+  font-size: 38px;
+  line-height: 1;
+  letter-spacing: 0.03em;
+}
+.split-speed small,
+.split-stats span,
+.split-status {
+  font:
+    500 8px 'DM Mono',
+    monospace;
+  letter-spacing: 0.1em;
+  color: rgba(255, 255, 255, 0.5);
+}
+.split-speed small {
+  margin-left: 6px;
+}
+.split-speed-track {
+  height: 2px;
+  margin: 6px 0 9px;
+  background: rgba(255, 255, 255, 0.18);
+}
+.split-speed-track span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--player);
+}
+.split-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.split-stats b {
+  display: block;
+  margin-top: 2px;
+  color: #f4f5ea;
+  font:
+    600 16px 'Barlow Condensed',
+    Impact,
+    sans-serif;
+  letter-spacing: 0.04em;
+}
+.split-status {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 9px;
+  white-space: nowrap;
+}
+.split-status [data-field='cruise'][data-state='cruising'],
+.split-status [data-field='cruise'][data-state='following'] {
+  color: var(--mint);
+}
+.split-status [data-field='cruise'][data-state='braking'] {
+  color: #ffcc4d;
+}
+.split-steer {
+  position: relative;
+  height: 2px;
+  margin-top: 10px;
+  background: rgba(255, 255, 255, 0.2);
+}
+.split-steer i {
+  position: absolute;
+  left: 50%;
+  top: -4px;
+  width: 3px;
+  height: 10px;
+  transform: translateX(-50%);
+  background: var(--player);
+}
+.split-crashed {
+  display: none;
+  margin-top: 8px;
+  color: #ff655d;
+  font-size: 22px;
+  letter-spacing: 0.12em;
+}
+.split-panel.is-crashed {
+  border-top-color: #ff655d;
+}
+.split-panel.is-crashed .split-crashed {
+  display: block;
+}
+.calibration-rings {
+  display: flex;
+  justify-content: center;
+  gap: 34px;
+}
+.calibration-player b {
+  display: block;
+  margin-top: 18px;
+  font:
+    600 9px 'DM Mono',
+    monospace;
+  letter-spacing: 0.12em;
+  color: rgba(255, 255, 255, 0.6);
+}
+.calibration-player .calibration-ring {
+  margin-top: 10px;
+}
+.split-results {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  margin: 25px 0 12px;
+  border-block: 1px solid var(--line);
+}
+.split-result {
+  padding: 17px 8px;
+  border-right: 1px solid var(--line);
+}
+.split-result:last-child {
+  border: 0;
+}
+.split-result span,
+.split-result small {
+  display: block;
+  font:
+    500 8px 'DM Mono',
+    monospace;
+  color: rgba(255, 255, 255, 0.44);
+  letter-spacing: 0.12em;
+}
+.split-result b {
+  display: block;
+  margin: 5px 0 4px;
+  font-size: 30px;
+}
+.split-result.is-winner b {
+  color: var(--acid);
+}
+.camera-divider {
+  display: none;
+}
+.game-shell.is-split .camera-shell {
+  right: auto;
+  left: 50%;
+  transform: translateX(-50%);
+  aspect-ratio: 16 / 9;
+}
+.game-shell.is-split .camera-shell.is-calibrating {
+  width: min(560px, calc(100vw - 30px), 70vh);
+}
+.game-shell.is-split .camera-divider {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 28px 12px 0;
+  pointer-events: none;
+  font:
+    600 10px 'DM Mono',
+    monospace;
+  color: var(--acid);
+}
+.game-shell.is-split .camera-divider span:last-child {
+  color: #6f9bff;
+}
+.game-shell.is-split .camera-divider::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  border-left: 1px dashed rgba(255, 255, 255, 0.55);
+}
+
+/* Start lights: the 3-2-1-GO in the middle of the screen. */
+.race-countdown {
+  position: absolute;
+  z-index: 9;
+  top: 38%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  color: #f4f5ea;
+  font:
+    italic 900 clamp(90px, 18vw, 180px) / 1 'Barlow Condensed',
+    Impact,
+    sans-serif;
+  text-shadow:
+    0 6px 0 rgba(0, 0, 0, 0.35),
+    0 0 40px rgba(0, 0, 0, 0.45);
+}
+.race-countdown[data-go='true'] {
+  color: var(--acid);
+}
+.race-countdown.is-pop {
+  animation: countdown-pop 0.9s ease-out both;
+}
+@keyframes countdown-pop {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.6);
+  }
+  25% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0.85;
+    transform: translate(-50%, -50%) scale(0.92);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .race-countdown.is-pop {
+    animation: none;
+  }
+}
+
+/* Race results. */
+.results-modal h2 {
+  margin-bottom: 0;
+}
+.record-flag {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 4px 10px;
+  background: var(--acid);
+  color: var(--ink);
+  font:
+    600 9px 'DM Mono',
+    monospace;
+  letter-spacing: 0.14em;
+}
+.results-track-slot {
+  margin: 4px 0 6px;
+}
+.results-modal .split-result b {
+  font-size: 24px;
+}
+
+/* Track picker on the start screen. */
+.track-picker {
+  margin: 0 0 8px;
+  text-align: left;
+}
+.track-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.track-picker-head > span,
+.lap-option > span {
+  color: rgba(255, 255, 255, 0.46);
+  font:
+    600 7px 'DM Mono',
+    monospace;
+  letter-spacing: 0.11em;
+}
+.lap-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: opacity 0.18s;
+}
+.lap-option.is-disabled {
+  opacity: 0.35;
+}
+.lap-option select {
+  height: 26px;
+  padding: 0 22px 0 8px;
+  border: 1px solid rgba(233, 255, 66, 0.38);
+  border-radius: 0;
+  background: #182126;
+  color: var(--acid);
+  font:
+    700 9px 'DM Mono',
+    monospace;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.lap-option select:disabled {
+  cursor: not-allowed;
+}
+.track-cards {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+.track-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 6px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.035);
+  color: #f4f5ea;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+.track-card:hover {
+  border-color: rgba(233, 255, 66, 0.45);
+}
+.track-card:focus-visible {
+  outline: 1px solid var(--acid);
+  outline-offset: 1px;
+}
+.track-card[aria-checked='true'] {
+  border-color: var(--acid);
+  background: rgba(233, 255, 66, 0.09);
+}
+.track-card b {
+  font:
+    700 14px 'Barlow Condensed',
+    Impact,
+    sans-serif;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.track-card small {
+  color: rgba(255, 255, 255, 0.5);
+  font:
+    500 7px 'DM Mono',
+    monospace;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+.track-badge {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  padding: 1px 4px;
+  font:
+    600 6px 'DM Mono',
+    monospace;
+  letter-spacing: 0.08em;
+  color: var(--ink);
+  background: var(--mint);
+}
+.track-badge[data-level='MEDIUM'] {
+  background: #ffcc4d;
+}
+.track-badge[data-level='HARD'] {
+  background: #ff6b5b;
+}
+.track-badge[data-level='FREE'] {
+  background: rgba(255, 255, 255, 0.7);
+}
+.track-card .track-record {
+  color: rgba(255, 255, 255, 0.3);
+}
+.track-card .track-record.has-record {
+  color: var(--mint);
+}
+.track-preview {
+  width: 100%;
+  max-width: 76px;
+  aspect-ratio: 1;
+  margin: 4px 0 2px;
+}
+.track-preview-road {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.16);
+  stroke-width: 7;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.track-preview-line {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.75);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.track-card[aria-checked='true'] .track-preview-line {
+  stroke: var(--acid);
+}
+.track-preview-flag {
+  fill: #f2f2f2;
+  stroke: #101214;
+  stroke-width: 1.4;
+}
+@media (max-width: 640px) {
+  .track-cards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Minimap: the circuit, its finish line and a dot per car, above the speedometer. */
+.minimap {
+  position: absolute;
+  z-index: 8;
+  left: 34px;
+  bottom: 158px;
+  width: 128px;
+  height: 128px;
+  padding: 6px;
+  pointer-events: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(10px);
+}
+.minimap.is-hidden {
+  display: none;
+}
+.minimap svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.minimap-road {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.14);
+  stroke-width: 8;
+  stroke-linejoin: round;
+}
+.minimap-line {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.7);
+  stroke-width: 1.8;
+  stroke-linejoin: round;
+}
+.minimap-finish rect {
+  fill: #f2f2f2;
+  stroke: #101214;
+  stroke-width: 1.2;
+}
+.minimap-finish path {
+  fill: #101214;
+}
+.minimap-car {
+  fill: var(--acid);
+  stroke: #101214;
+  stroke-width: 1.6;
+}
+.minimap-car[data-player='2'] {
+  fill: #6f9bff;
+}
+/* Split screen: above player one's panel. */
+.game-shell.is-split .minimap {
+  left: 20px;
+  bottom: 178px;
+}
+@media (max-width: 760px) {
+  .minimap {
+    left: 17px;
+    bottom: 142px;
+    width: 96px;
+    height: 96px;
+    padding: 4px;
   }
 }

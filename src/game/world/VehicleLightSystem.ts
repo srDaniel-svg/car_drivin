@@ -80,7 +80,7 @@ export class VehicleLightSystem {
   private glowCount = 0;
   private poolCount = 0;
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     this.headlight = new THREE.SpotLight(0xfff0d8, 0, 220, 0.36, 0.85, 0.6);
     this.headlight.name = 'player-headlight';
     this.headlight.castShadow = false;

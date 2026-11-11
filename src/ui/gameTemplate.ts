@@ -5,6 +5,7 @@ import {
   DEFAULT_CAR_MODEL_ID,
 } from '../game/vehicleCatalog';
 import { TIME_OF_DAY_OPTIONS, WEATHER_OPTIONS } from '../game/conditionsCatalog';
+import { createTrackPickerMarkup } from './TrackSettings';
 
 const optionList = (options: readonly { id: string; label: string }[]): string =>
   options.map(({ id, label }) => `<option value="${id}">${label}</option>`).join('');
@@ -65,16 +66,34 @@ export function createGameTemplate(): string {
           <div class="speed-number"><span id="speed">000</span><small>KM/H</small></div>
           <div class="speed-track"><span id="speed-fill"></span></div>
         </div>
-        <div class="run-stats">
-          <div><span>DISTANCE</span><strong id="distance">0.00 <small>KM</small></strong></div>
-          <div><span>OVERTAKES</span><strong id="overtakes">0</strong></div>
-          <div><span>SCORE</span><strong id="score">000000</strong></div>
+        <div id="run-stats" class="run-stats">
+          <div class="race-stat"><span>POSITION</span><strong id="race-position">1<small>ST</small></strong></div>
+          <div class="race-stat"><span>LAP</span><strong id="race-lap">1<small>/3</small></strong></div>
+          <div class="race-stat"><span id="race-time-label">LAP TIME</span><strong id="race-time">0:00.00</strong></div>
+          <div class="race-stat"><span>BEST LAP</span><strong id="race-best">-:--.--</strong></div>
+          <div class="free-stat"><span>DISTANCE</span><strong id="distance">0.00 <small>KM</small></strong></div>
+          <div class="free-stat"><span>OVERTAKES</span><strong id="overtakes">0</strong></div>
+          <div class="free-stat"><span>SCORE</span><strong id="score">000000</strong></div>
         </div>
         <div id="assist" class="assist"><i></i><span>READY</span></div>
         <div class="steer-meter">
           <span>L</span><div class="steer-track"><i id="steer-indicator"></i></div><span>R</span>
         </div>
       </section>
+
+      <section id="split-hud" class="split-hud is-hidden" aria-live="polite"></section>
+      <div id="race-countdown" class="race-countdown is-hidden" aria-live="assertive"></div>
+      <div id="minimap" class="minimap is-hidden" aria-hidden="true">
+        <svg viewBox="0 0 100 100">
+          <path class="minimap-road"></path>
+          <path class="minimap-line"></path>
+          <g class="minimap-finish">
+            <rect x="45.5" y="11" width="9" height="14"></rect>
+            <path d="M45.5 11h3v3.5h-3zM51.5 11h3v3.5h-3zM48.5 14.5h3v3.5h-3zM45.5 18h3v3.5h-3zM51.5 18h3v3.5h-3zM48.5 21.5h3v3.5h-3z"></path>
+          </g>
+          <g class="minimap-cars"></g>
+        </svg>
+      </div>
 
       <aside id="performance-hud" class="performance-hud is-hidden" aria-label="Performance diagnostics">
         <div class="performance-hud-title"><span>PERFORMANCE</span><small>F3</small></div>
@@ -93,6 +112,8 @@ export function createGameTemplate(): string {
       <aside class="camera-shell is-offline is-hidden" aria-label="Camera tracking preview">
         <video id="camera-video" playsinline muted></video>
         <canvas id="camera-canvas"></canvas>
+        <canvas id="camera-canvas-2" class="camera-canvas-second"></canvas>
+        <div class="camera-divider" aria-hidden="true"><span>P1</span><span>P2</span></div>
         <div class="camera-topline"><span><i></i> HAND CAM</span><button id="hide-camera">HIDE</button></div>
         <div id="camera-hint" class="camera-hint">WAITING FOR CAMERA</div>
       </aside>
@@ -144,16 +165,21 @@ export function createGameTemplate(): string {
             <div><b>03</b><span>Thumbs up: slow to 40<br>open palms: full brake</span></div>
           </div>
           <div id="car-options" class="car-options">
-            <label><span>YOUR CAR</span><select id="driver-car" aria-label="Choose your car model">${carOptions}</select></label>
+            <label><span>PLAYERS</span><select id="player-count" aria-label="Choose one player or two-player split screen"><option value="1">1 PLAYER</option><option value="2">2 PLAYERS · SPLIT</option></select></label>
+            <label><span id="driver-car-label">YOUR CAR</span><select id="driver-car" aria-label="Choose your car model">${carOptions}</select></label>
+            <label class="second-driver-option is-hidden"><span>PLAYER 2 CAR</span><select id="second-driver-car" aria-label="Choose player two's car model">${carOptions}</select></label>
             <label><span>TRAFFIC CARS</span><select id="traffic-count" aria-label="Choose number of traffic cars">${trafficOptions}</select></label>
             <label><span>CAR VARIETY</span><select id="car-model-count" aria-label="Choose number of different car models">${varietyOptions}</select></label>
             <label class="condition-option"><span>TIME OF DAY</span><select id="time-of-day" aria-label="Choose the time of day">${timeOfDayOptions}</select></label>
             <label class="condition-option"><span>WEATHER</span><select id="weather" aria-label="Choose the weather">${weatherOptions}</select></label>
           </div>
+          ${createTrackPickerMarkup()}
           <p class="traffic-performance-note"><i>!</i> More traffic cars or model variety may reduce frame rates on lower-powered devices.</p>
+          <p id="split-note" class="split-note is-hidden"><i>2P</i> One camera, split down the middle: sit side by side, each player keeping both hands on their own half. Player 1 drives the left screen, player 2 the right.</p>
           <div class="modal-actions">
             <button id="camera-start" class="primary-button"><span>START WITH HANDS</span><i>→</i></button>
-            <button id="keyboard-start" class="secondary-button">USE KEYBOARD INSTEAD <small>WASD / ARROWS</small></button>
+            <button id="remote-start" class="secondary-button">📡 USE REMOTE CAMERA <small>ANOTHER DEVICE</small></button>
+            <button id="keyboard-start" class="secondary-button">USE KEYBOARD INSTEAD <small id="keyboard-start-keys">WASD / ARROWS</small></button>
           </div>
           <p class="privacy"><i>●</i> Camera processing stays on this device. No video is saved or uploaded.</p>
         </div>

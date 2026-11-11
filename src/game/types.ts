@@ -1,5 +1,12 @@
 export type GamePhase =
-  'loading' | 'permission' | 'calibrating' | 'ready' | 'playing' | 'paused' | 'crashed';
+  | 'loading'
+  | 'permission'
+  | 'calibrating'
+  | 'ready'
+  | 'playing'
+  | 'paused'
+  | 'crashed'
+  | 'finished';
 export type ControlMode = 'hands' | 'keyboard';
 
 /** How an input reaches reverse: hold the full brake at a standstill. */
@@ -37,6 +44,26 @@ export interface CruiseSnapshot {
   setKph: number;
 }
 
+/** A driver's race on a circuit. */
+export interface RaceSnapshot {
+  /** The lap being driven, 1-based; stays on the last lap once finished. */
+  lap: number;
+  laps: number;
+  /** Time on the current lap, or the total race time once finished, in seconds. */
+  lapTime: number;
+  lastLap: number | null;
+  bestLap: number | null;
+  /** Race clock in seconds; frozen at the finish. */
+  totalTime: number;
+  /** 1 for the leader. */
+  position: number;
+  finished: boolean;
+  /** Seconds until the start; 0 to −1 just after it (show GO), −1 once racing. */
+  countdown: number;
+  /** Where the car is along the road, in world units, for the minimap. */
+  roadDistance: number;
+}
+
 export interface GameSnapshot {
   /** Speed over the ground, forward or in reverse. */
   speedKph: number;
@@ -49,4 +76,6 @@ export interface GameSnapshot {
   assistMessage: string;
   /** How hard the tyres are sliding, 0 to 1, for the skid sound. */
   skid: number;
+  /** Lap and timing details on a circuit; null on the free road. */
+  race: RaceSnapshot | null;
 }

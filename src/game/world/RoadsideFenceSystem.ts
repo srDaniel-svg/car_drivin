@@ -38,7 +38,7 @@ export class RoadsideFenceSystem {
   );
   private initialized = false;
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     this.posts.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.rails.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.posts.castShadow = true;
@@ -56,6 +56,11 @@ export class RoadsideFenceSystem {
       });
     }
     this.scene.add(this.posts, this.rails);
+  }
+
+  /** Re-places every post on the next update, for a newly chosen track. */
+  reset(): void {
+    this.initialized = false;
   }
 
   update(playerDistance: number, viewAlong = 1): void {

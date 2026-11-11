@@ -6,6 +6,8 @@
 
 **[▶ Play in your browser](https://iakashkanaujiya.github.io/car_driving/)** (Chrome or Edge on a computer with a webcam; keyboard controls work too.)
 
+> **Modified version.** This repository is a modified copy of [Hands-On Highway (Driftline)](https://github.com/iakashkanaujiya/car_driving) by Akash Kanaujiya, shared for non-commercial use under the original [LICENSE](LICENSE). Changes include: four race circuits with a start/finish gantry, a track picker with previews and lap counts, lap timing and positions for one or two players, a 3-2-1 start countdown, respawns after crashes, race results with saved lap records, a circuit minimap, and a remote-camera option.
+
 Hand tracking runs entirely on your device with MediaPipe, so camera video is never uploaded. The car accelerates automatically; slowing down for curves and traffic is up to you.
 
 ## Gameplay
@@ -94,6 +96,16 @@ On the first visit, a setup popup keeps the game locked while it downloads appro
 - **Graphics:** open Graphics in the top bar to choose Auto, Low, Medium, or High quality. Low renders directly for speed; Medium and High add HDR bloom, MSAA, colour grading and a denser photoreal forest band. The same panel sets the time of day and weather. All choices are saved locally.
 
 Hand-control mode accelerates automatically and only brakes on its own when it loses your hands. Keyboard mode uses manual acceleration and braking. Neither mode brakes for traffic or curves unless adaptive cruise is on, so watch the road ahead. The road has four lanes and traffic drives on the left: the two left lanes carry traffic going your way, so overtake in the inner one, and the two right lanes carry oncoming vehicles.
+
+## Two players: split screen
+
+Choose **2 PLAYERS · SPLIT** on the start screen and pick a car for each player. The screen splits side by side: player 1 drives the left half, player 2 the right, each with their own chase camera, HUD and adaptive cruise, on the same road and through the same traffic.
+
+- **Hands, one camera:** sit side by side in front of one webcam. The game opens it at 1280×720 and splits the picture down the middle; each half is tracked by its own MediaPipe worker and calibrated on its own, so each player keeps both hands on their own side (the camera preview shows the dividing line). Every hand gesture works per player.
+- **Keyboard:** player 1 uses `W` `A` `S` `D`, `Space` for the handbrake, `C` for adaptive cruise and `-` / `+` for its speed. Player 2 uses the arrow keys, `Right Shift` for the handbrake, `Right Ctrl` or `Numpad 0` for adaptive cruise and `Numpad -` / `Numpad +` for its speed.
+- **Crashes:** a driver who hits traffic, or the other player, is out, and their wreck stays on the road. The race ends when both have crashed, and the higher score wins.
+
+Drawing two views costs roughly twice the GPU work of one, and tracking two players doubles the hand-tracking work; Auto quality lowers the detail if the frame rate drops.
 
 ## Rendering
 

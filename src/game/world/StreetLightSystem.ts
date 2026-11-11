@@ -123,7 +123,7 @@ export class StreetLightSystem {
   private fogDensity = 0;
   private placed = false;
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     for (let index = 0; index < LAMPS_PER_SIDE; index += 1) {
       const distance = -STREET_LIGHT_SPACING + index * STREET_LIGHT_SPACING;
       this.slots.push({ distance, side: -1 });
@@ -191,6 +191,11 @@ export class StreetLightSystem {
     this.pools.visible = lit;
     this.glows.visible = lit;
     this.passingLight.visible = lit;
+  }
+
+  /** Re-places every lamp on the next update, for a newly chosen track. */
+  reset(): void {
+    this.placed = false;
   }
 
   update(

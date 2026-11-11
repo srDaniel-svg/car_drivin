@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { KEYBOARD_REVERSE } from '../game/config';
-import { KeyboardController } from './KeyboardController';
+import { KeyboardController, PLAYER_ONE_KEYS, PLAYER_TWO_KEYS } from './KeyboardController';
 
 class FakeKeyboardTarget {
   private readonly listeners = new Map<string, Set<EventListener>>();
@@ -69,5 +69,22 @@ describe('KeyboardController', () => {
       active: false,
     });
     keyboard.dispose();
+  });
+
+  it('gives split-screen players separate keys', () => {
+    const target = new FakeKeyboardTarget();
+    const playerOne = new KeyboardController(target as unknown as Window, PLAYER_ONE_KEYS);
+    const playerTwo = new KeyboardController(target as unknown as Window, PLAYER_TWO_KEYS);
+
+    target.dispatch('keydown', 'KeyW');
+    target.dispatch('keydown', 'KeyD');
+    target.dispatch('keydown', 'ArrowDown');
+    target.dispatch('keydown', 'ArrowLeft');
+    expect(playerOne.getInput()).toMatchObject({ steering: 1, accelerating: true, braking: false });
+    expect(playerTwo.getInput()).toMatchObject({
+      steering: -1,
+      accelerating: false,
+      braking: true,
+    });
   });
 });

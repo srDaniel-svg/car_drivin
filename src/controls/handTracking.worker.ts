@@ -34,9 +34,9 @@ workerScope.onmessage = (event): void => {
           baseOptions: { modelAssetPath: message.modelAssetPath, delegate: 'CPU' },
           runningMode: 'VIDEO',
           numHands: 2,
-          minHandDetectionConfidence: 0.55,
-          minHandPresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
+          minHandDetectionConfidence: 0.65,
+          minHandPresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
         });
         send({ type: 'ready' });
       } catch (error) {

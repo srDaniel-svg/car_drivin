@@ -57,7 +57,7 @@ export class RoadsideScenerySystem {
   private readonly scale = new THREE.Vector3();
   private readonly up = new THREE.Vector3(0, 1, 0);
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     let treeCount = 0;
     let rockCount = 0;
     const rockInstances = new Array<number>(ROCK_VARIANTS).fill(0);

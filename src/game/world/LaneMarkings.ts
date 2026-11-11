@@ -48,7 +48,7 @@ export class LaneMarkings {
   });
   private readonly meshes: THREE.Mesh[];
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     this.meshes = laneDividerOffsets.map((offset) => {
       const geometry = createRoadStrip(LINE_WIDTH, SEGMENTS, offset, 1, DASH_PERIOD);
       const mesh = new THREE.Mesh(geometry, this.material);

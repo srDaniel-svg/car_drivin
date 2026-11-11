@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote Hand Tracker — Hands-On Highway</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    h1 { font-size: 1.4rem; letter-spacing: 0.08em; margin-bottom: 0.25rem; }
+    .subtitle { font-size: 0.85rem; opacity: 0.6; margin-bottom: 1.5rem; }
+    .camera-box {
+      position: relative;
+      width: min(100%, 480px);
+      aspect-ratio: 4/3;
+      background: #111;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 2px solid #222;
+    }
+    .camera-box video {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+    .camera-box canvas {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%;
+      transform: scaleX(-1);
+      pointer-events: none;
+    }
+    .status-bar {
+      margin-top: 1rem;
+      padding: 0.6rem 1.2rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-align: center;
+      transition: background 0.3s, color 0.3s;
+    }
+    .status-bar.connecting { background: #332800; color: #ffb800; }
+    .status-bar.waiting    { background: #1a1a2e; color: #7788ff; }
+    .status-bar.tracking   { background: #0a2a0a; color: #44dd66; }
+    .status-bar.error      { background: #2a0a0a; color: #ff4444; }
+    .stats {
+      margin-top: 0.75rem;
+      font-size: 0.78rem;
+      opacity: 0.5;
+      font-variant-numeric: tabular-nums;
+    }
+    button {
+      margin-top: 1.5rem;
+      padding: 0.7rem 2rem;
+      border: none;
+      border-radius: 8px;
+      background: #2255ff;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      letter-spacing: 0.04em;
+    }
+    button:hover { background: #3366ff; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .instructions {
+      max-width: 420px;
+      margin-top: 1.5rem;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      opacity: 0.55;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>📡 REMOTE HAND TRACKER</h1>
+  <p class="subtitle">Hands-On Highway — camera offload</p>
+
+  <div class="camera-box">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="status" class="status-bar connecting">CONNECTING…</div>
+  <div id="stats" class="stats"></div>
+
+  <button id="start-btn">START TRACKING</button>
+
+  <p class="instructions">
+    This page runs MediaPipe hand tracking and sends the landmarks to the game
+    over the local network. Open the game on another computer and choose
+    <b>"Remote Camera"</b> to connect.
+  </p>
+
+  <script type="module">
+    import { FilesetResolver, HandLandmarker } from '../mediapipe/wasm/vision_bundle.mjs';
+
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('overlay');
+    const ctx      = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const statsEl  = document.getElementById('stats');
+    const startBtn = document.getElementById('start-btn');
+
+    let ws = null;
+    let landmarker = null;
+    let running = false;
+    let frameCount = 0;
+    let lastCountTime = performance.now();
+
+    // ── WebSocket ───────────────────────────────────────────────────
+    function connectWebSocket() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${location.host}/ws-tracking`);
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'register', role: 'tracker' }));
+        setStatus('waiting', 'CONNECTED — waiting for game client');
+        startBtn.disabled = false;
+      };
+      ws.onerror = () => setStatus('error', 'CONNECTION FAILED — is the game server running?');
+      ws.onclose = () => {
+        if (running) setStatus('error', 'DISCONNECTED');
+        setTimeout(connectWebSocket, 3000);
+      };
+    }
+
+    // ── Camera ──────────────────────────────────────────────────────
+    async function openCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 320 }, height: { ideal: 240 }, facingMode: 'user' },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+    }
+
+    // ── MediaPipe ───────────────────────────────────────────────────
+    async function initMediaPipe() {
+      const base = new URL('..', location.href).href;
+      const wasmRoot = `${base}mediapipe/wasm`;
+      const modelPath = `${base}mediapipe/hand_landmarker.task`;
+
+      let vision;
+      try {
+        vision = await FilesetResolver.forVisionTasks(wasmRoot);
+      } catch {
+        vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm',
+        );
+      }
+
+      try {
+        landmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55,
+        });
+      } catch {
+        landmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'CPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55,
+        });
+      }
+    }
+
+    // ── Tracking loop ───────────────────────────────────────────────
+    const INTERVAL_MS = 1000 / 15;
+    let lastVideoTime = -1;
+    let lastInferenceTime = 0;
+
+    function trackFrame(now) {
+      if (!running) return;
+      requestAnimationFrame(trackFrame);
+
+      if (
+        video.readyState < 2 ||
+        video.currentTime === lastVideoTime ||
+        now - lastInferenceTime < INTERVAL_MS
+      )
+        return;
+
+      lastVideoTime = video.currentTime;
+      lastInferenceTime = now;
+
+      const result = landmarker.detectForVideo(video, now);
+      const landmarks = result.landmarks.map((hand) =>
+        hand.map((p) => ({ x: p.x, y: p.y, z: p.z })),
+      );
+      const handednessScores = result.handedness.map((c) => c[0]?.score ?? 0.7);
+
+      // Send to game
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'tracking',
+          result: { landmarks, handednessScores },
+        }));
+      }
+
+      // Draw preview
+      drawPreview(result.landmarks);
+
+      // FPS counter
+      frameCount++;
+      if (now - lastCountTime > 1000) {
+        statsEl.textContent = `${frameCount} detections/sec · ${landmarks.length} hand(s)`;
+        frameCount = 0;
+        lastCountTime = now;
+      }
+    }
+
+    function drawPreview(hands) {
+      const w = video.videoWidth || 320;
+      const h = video.videoHeight || 240;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      ctx.clearRect(0, 0, w, h);
+
+      for (const hand of hands) {
+        // Draw connections
+        ctx.strokeStyle = 'rgba(68, 221, 102, 0.6)';
+        ctx.lineWidth = 2;
+        const connections = [
+          [0,1],[1,2],[2,3],[3,4],
+          [0,5],[5,6],[6,7],[7,8],
+          [5,9],[9,10],[10,11],[11,12],
+          [9,13],[13,14],[14,15],[15,16],
+          [13,17],[17,18],[18,19],[19,20],
+          [0,17],
+        ];
+        for (const [a, b] of connections) {
+          ctx.beginPath();
+          ctx.moveTo(hand[a].x * w, hand[a].y * h);
+          ctx.lineTo(hand[b].x * w, hand[b].y * h);
+          ctx.stroke();
+        }
+        // Draw landmarks
+        for (const point of hand) {
+          ctx.beginPath();
+          ctx.arc(point.x * w, point.y * h, 3, 0, Math.PI * 2);
+          ctx.fillStyle = '#44dd66';
+          ctx.fill();
+        }
+      }
+    }
+
+    // ── Start button ────────────────────────────────────────────────
+    startBtn.disabled = true;
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      startBtn.textContent = 'LOADING…';
+      try {
+        setStatus('connecting', 'OPENING CAMERA…');
+        await openCamera();
+        setStatus('connecting', 'LOADING HAND MODEL…');
+        await initMediaPipe();
+        setStatus('tracking', 'TRACKING — sending landmarks to game');
+        running = true;
+        startBtn.style.display = 'none';
+        requestAnimationFrame(trackFrame);
+      } catch (err) {
+        setStatus('error', `ERROR: ${err.message}`);
+        startBtn.disabled = false;
+        startBtn.textContent = 'RETRY';
+      }
+    });
+
+    function setStatus(state, text) {
+      statusEl.className = `status-bar ${state}`;
+      statusEl.textContent = text;
+    }
+
+    // Auto-connect
+    connectWebSocket();
+  </script>
+</body>
+</html>
+

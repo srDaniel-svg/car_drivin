@@ -1,11 +1,19 @@
 import { EngineSound } from '../audio/EngineSound';
 import type { HandCommand, HandController } from '../controls/HandController';
-import { KeyboardController } from '../controls/KeyboardController';
+import type { RemoteHandCommand } from '../controls/RemoteHandController';
+import {
+  KeyboardController,
+  PLAYER_ONE_KEYS,
+  PLAYER_TWO_KEYS,
+} from '../controls/KeyboardController';
 import type { DrivingGame } from '../game/DrivingGame';
 import type { DrivingConditions } from '../game/conditionsCatalog';
 import type { ControlInput, ControlMode, GameSnapshot } from '../game/types';
 import { DEFAULT_CAR_MODEL_ID } from '../game/vehicleCatalog';
 import type { CarModelId } from '../game/vehicleCatalog';
+import { formatLapTime } from '../game/simulation/raceLaps';
+import { getTrack } from '../game/tracks';
+import { ordinalSuffix } from '../ui/GameHud';
 import { cacheAssets } from '../services/assetCache';
 import { AssetGate } from '../ui/AssetGate';
 import { ConditionsSettings } from '../ui/ConditionsSettings';
@@ -13,8 +21,17 @@ import { byId } from '../ui/dom';
 import { GameHud } from '../ui/GameHud';
 import { GraphicsSettings } from '../ui/GraphicsSettings';
 import { PerformanceHud } from '../ui/PerformanceHud';
+import { Minimap } from '../ui/Minimap';
+import { RaceCountdown } from '../ui/RaceCountdown';
+import { SplitHud } from '../ui/SplitHud';
+import { saveBestLap } from '../ui/trackRecords';
+import { TrackSettings } from '../ui/TrackSettings';
+import type { TrackChoice } from '../ui/TrackSettings';
 
 type TrackingState = 'ok' | 'warn' | 'off';
+
+/** Keys that hold each split-screen player's handbrake. */
+const HANDBRAKE_KEYS: readonly (readonly string[])[] = [['Space'], ['ShiftRight']];
 
 /** Coordinates UI intent with the input, audio, asset, and game subsystems. */
 export class DrivingApplication {
@@ -22,15 +39,22 @@ export class DrivingApplication {
   private readonly keyboard = new KeyboardController();
   private readonly audio = new EngineSound();
   private readonly hud = new GameHud();
+  private readonly splitHud = new SplitHud();
   private readonly graphicsSettings = new GraphicsSettings();
   private readonly conditionsSettings = new ConditionsSettings();
+  private readonly trackSettings = new TrackSettings();
+  private readonly raceCountdown = new RaceCountdown();
+  private readonly minimap = new Minimap();
   private readonly performanceHud = new PerformanceHud();
   private readonly assetGate = new AssetGate();
   private readonly viewport = byId<HTMLDivElement>('viewport');
   private readonly gameShell = document.querySelector<HTMLElement>('.game-shell');
   private readonly overlay = byId<HTMLElement>('overlay');
   private readonly video = byId<HTMLVideoElement>('camera-video');
-  private readonly cameraCanvas = byId<HTMLCanvasElement>('camera-canvas');
+  private readonly cameraCanvases = [
+    byId<HTMLCanvasElement>('camera-canvas'),
+    byId<HTMLCanvasElement>('camera-canvas-2'),
+  ];
   private readonly cameraShell = document.querySelector<HTMLElement>('.camera-shell');
   private readonly trackingPill = byId<HTMLElement>('tracking-pill');
   private readonly trackingLabel = byId<HTMLElement>('tracking-label');
@@ -39,13 +63,23 @@ export class DrivingApplication {
   private readonly fullscreenButton = byId<HTMLButtonElement>('fullscreen-button');
 
   private game: DrivingGame | null = null;
-  private handController: HandController | null = null;
+  private handControllers: HandController[] = [];
+  private remoteControllers: import('../controls/RemoteHandController').RemoteHandController[] = [];
+  /** Per-player keyboards for split screen, created on first use. */
+  private splitKeyboards: KeyboardController[] = [];
+  /** The camera opened for split screen, shared by both players' trackers. */
+  private sharedStream: MediaStream | null = null;
+  private handStatuses: string[] = [];
+  /** Per player: how far calibration has got, 0 to 1. */
+  private handProgress: number[] = [];
   private mode: ControlMode = 'hands';
-  private lastSnapshot: GameSnapshot | null = null;
+  private lastSnapshots: GameSnapshot[] = [];
   private soundEnabled = true;
-  /** Space is held: the handbrake, in either control mode. */
-  private handbrakeHeld = false;
+  /** Per player: the handbrake key is held, in either control mode. */
+  private handbrakeHeld = [false, false];
   private driverCar: CarModelId = DEFAULT_CAR_MODEL_ID;
+  private secondDriverCar: CarModelId = DEFAULT_CAR_MODEL_ID;
+  private playerCount: 1 | 2 = 1;
   private trafficCount = 4;
   private modelCount = 1;
   private assetsReady: Promise<boolean> = Promise.resolve(false);
@@ -65,10 +99,18 @@ export class DrivingApplication {
 
   dispose(): void {
     this.events.abort();
-    this.handController?.stop();
+    this.stopHandControllers();
+    this.remoteControllers.forEach((controller) => controller.stop());
+    this.remoteControllers = [];
     this.keyboard.dispose();
+    this.splitKeyboards.forEach((keyboard) => keyboard.dispose());
     this.audio.stop();
     this.game?.dispose();
+  }
+
+  /** Players actually in the game: fixed once the cars are applied. */
+  private get players(): number {
+    return this.game?.getPlayerCount() ?? this.playerCount;
   }
 
   private bindUiEvents(): void {
@@ -81,6 +123,7 @@ export class DrivingApplication {
       },
       this.events.signal,
     );
+    this.trackSettings.bind((choice) => this.applyTrack(choice), this.events.signal);
     this.conditionsSettings.bind(
       (conditions) => this.applyConditions(conditions),
       this.events.signal,
@@ -92,10 +135,24 @@ export class DrivingApplication {
       },
       options,
     );
+    byId<HTMLSelectElement>('player-count').addEventListener(
+      'change',
+      (event) => {
+        this.setPlayerCount((event.currentTarget as HTMLSelectElement).value === '2' ? 2 : 1);
+      },
+      options,
+    );
     byId<HTMLSelectElement>('driver-car').addEventListener(
       'change',
       (event) => {
         this.driverCar = (event.currentTarget as HTMLSelectElement).value as CarModelId;
+      },
+      options,
+    );
+    byId<HTMLSelectElement>('second-driver-car').addEventListener(
+      'change',
+      (event) => {
+        this.secondDriverCar = (event.currentTarget as HTMLSelectElement).value as CarModelId;
       },
       options,
     );
@@ -121,10 +178,17 @@ export class DrivingApplication {
       options,
     );
     byId('keyboard-start').addEventListener('click', () => void this.useKeyboard(), options);
+    byId('remote-start').addEventListener(
+      'click',
+      (event) => {
+        void this.useRemoteHandControls(event.currentTarget as HTMLButtonElement);
+      },
+      options,
+    );
     this.pauseButton.addEventListener('click', () => this.togglePause(), options);
-    byId('cruise-toggle').addEventListener('click', () => this.game?.toggleCruise(), options);
-    byId('cruise-down').addEventListener('click', () => this.game?.adjustCruise(-1), options);
-    byId('cruise-up').addEventListener('click', () => this.game?.adjustCruise(1), options);
+    byId('cruise-toggle').addEventListener('click', () => this.game?.toggleCruise(0), options);
+    byId('cruise-down').addEventListener('click', () => this.game?.adjustCruise(-1, 0), options);
+    byId('cruise-up').addEventListener('click', () => this.game?.adjustCruise(1, 0), options);
     byId('hide-camera').addEventListener('click', () => this.setCameraVisible(false), options);
     byId('show-camera').addEventListener('click', () => this.setCameraVisible(true), options);
     byId<HTMLButtonElement>('mute-button').addEventListener(
@@ -143,7 +207,8 @@ export class DrivingApplication {
     document.addEventListener(
       'visibilitychange',
       () => {
-        this.handController?.setPaused(document.hidden);
+        this.handControllers.forEach((controller) => controller.setPaused(document.hidden));
+        this.remoteControllers.forEach((controller) => controller.setPaused(document.hidden));
       },
       options,
     );
@@ -152,10 +217,11 @@ export class DrivingApplication {
       'keyup',
       (event) => {
         if (event.code === 'KeyH') this.audio.setHorn(false);
-        if (event.code === 'Space') {
+        const player = this.handbrakePlayer(event.code);
+        if (player >= 0) {
           // Space would otherwise press whichever button has focus.
-          if (this.handbrakeHeld) event.preventDefault();
-          this.handbrakeHeld = false;
+          if (this.handbrakeHeld[player]) event.preventDefault();
+          this.handbrakeHeld[player] = false;
         }
       },
       options,
@@ -164,11 +230,20 @@ export class DrivingApplication {
       'blur',
       () => {
         this.audio.setHorn(false);
-        this.handbrakeHeld = false;
+        this.handbrakeHeld = [false, false];
       },
       options,
     );
     window.addEventListener('beforeunload', () => this.dispose(), { once: true });
+  }
+
+  private setPlayerCount(count: 1 | 2): void {
+    this.playerCount = count;
+    const split = count === 2;
+    document.querySelector('.second-driver-option')?.classList.toggle('is-hidden', !split);
+    byId('split-note').classList.toggle('is-hidden', !split);
+    byId('driver-car-label').textContent = split ? 'PLAYER 1 CAR' : 'YOUR CAR';
+    byId('keyboard-start-keys').textContent = split ? 'P1 WASD · P2 ARROWS' : 'WASD / ARROWS';
   }
 
   private async installAssets(): Promise<boolean> {
@@ -205,20 +280,40 @@ export class DrivingApplication {
     const { DrivingGame } = await import('../game/DrivingGame');
     const game = new DrivingGame(
       this.viewport,
-      () => this.getControl(),
-      (snapshot) => {
-        this.lastSnapshot = snapshot;
-        this.hud.update(snapshot, this.getControl().steering);
-        this.audio.update(snapshot.speedKph);
-        this.audio.setSkid(snapshot.skid);
-      },
+      (playerIndex) => this.getControl(playerIndex),
+      (snapshots) => this.onSnapshots(snapshots),
       () => this.showCrash(),
+      (results) => this.showRaceResults(results),
       (snapshot) => this.performanceHud.update(snapshot),
     );
     game.setPerformanceMonitoring(this.performanceHud.isVisible());
     game.setGraphicsQuality(this.graphicsSettings.getMode());
     game.setConditions(this.conditionsSettings.get());
+    this.applyTrack(this.trackSettings.get(), game);
     return game;
+  }
+
+  private onSnapshots(snapshots: GameSnapshot[]): void {
+    this.lastSnapshots = snapshots;
+    this.raceCountdown.update(snapshots);
+    this.minimap.update(snapshots);
+    if (snapshots.length === 1) {
+      this.hud.update(snapshots[0], this.getControl(0).steering);
+    } else {
+      this.splitHud.update(
+        snapshots,
+        snapshots.map((_, index) => this.getControl(index).steering),
+      );
+    }
+    // One engine note for the room: it follows whoever is driving fastest.
+    const driving = snapshots.filter((snapshot) => snapshot.phase !== 'crashed');
+    this.audio.update(Math.max(0, ...driving.map((snapshot) => snapshot.speedKph)));
+    this.audio.setSkid(Math.max(0, ...snapshots.map((snapshot) => snapshot.skid)));
+  }
+
+  /** Shows the chosen track behind the start screen; the next run races on it. */
+  private applyTrack(choice: TrackChoice, game = this.game): void {
+    game?.setTrack(choice.trackId, choice.laps);
   }
 
   private applyConditions(conditions: DrivingConditions): void {
@@ -226,18 +321,31 @@ export class DrivingApplication {
     this.audio.setRain(conditions.weather === 'rain' ? 1 : 0);
   }
 
-  private getControl(): ControlInput {
-    const handbrake = this.handbrakeHeld;
+  private getControl(playerIndex: number): ControlInput {
+    const handbrake = this.handbrakeHeld[playerIndex] ?? false;
     if (this.mode === 'hands') {
-      const input = this.handController?.getInput() ?? {
-        steering: 0,
-        confidence: 0,
-        active: false,
-      };
+      const input =
+        this.remoteControllers[playerIndex]?.getInput() ??
+        this.handControllers[playerIndex]?.getInput() ?? {
+          steering: 0,
+          confidence: 0,
+          active: false,
+        };
       return { ...input, handbrake };
     }
     // Keyboard mode remains active while keys are released so coasting works.
-    return { ...this.keyboard.getInput(), active: true, handbrake };
+    const keyboard = this.players > 1 ? this.splitKeyboard(playerIndex) : this.keyboard;
+    return { ...keyboard.getInput(), active: true, handbrake };
+  }
+
+  private splitKeyboard(playerIndex: number): KeyboardController {
+    if (this.splitKeyboards.length === 0) {
+      this.splitKeyboards = [
+        new KeyboardController(window, PLAYER_ONE_KEYS),
+        new KeyboardController(window, PLAYER_TWO_KEYS),
+      ];
+    }
+    return this.splitKeyboards[playerIndex] ?? this.splitKeyboards[0];
   }
 
   private async prepareSelectedCars(button?: HTMLButtonElement): Promise<boolean> {
@@ -253,7 +361,14 @@ export class DrivingApplication {
       ]);
       if (!assetsAvailable || !sceneAvailable || !this.game)
         throw new Error('Required assets are unavailable.');
-      await this.game.setCars(this.driverCar, this.trafficCount, this.modelCount);
+      this.applyTrack(this.trackSettings.get());
+      await this.game.setCars(
+        this.driverCar,
+        this.trafficCount,
+        this.modelCount,
+        this.playerCount === 2 ? this.secondDriverCar : undefined,
+      );
+      this.gameShell!.classList.toggle('is-split', this.players > 1);
       return true;
     } catch (error) {
       console.error('Could not prepare the game.', error);
@@ -269,16 +384,29 @@ export class DrivingApplication {
 
   private async useHandControls(button: HTMLButtonElement): Promise<void> {
     if (!(await this.prepareSelectedCars(button))) return;
+    const players = this.players;
     this.mode = 'hands';
     this.audio.start();
     this.cameraShell!.classList.remove('is-offline', 'is-hidden');
     this.cameraShell!.classList.add('is-calibrating');
+    const rings = Array.from(
+      { length: players },
+      (_, index) => `
+        <div class="calibration-player">
+          ${players > 1 ? `<b>PLAYER ${index + 1}</b>` : ''}
+          <div class="calibration-ring" data-player="${index}"><span>0%</span></div>
+        </div>`,
+    ).join('');
     this.overlay.innerHTML = `
       <div class="modal compact-modal calibration-modal">
         <div class="eyebrow"><span></span> CALIBRATING</div>
-        <h2>HOLD THE WHEEL.</h2>
-        <p>Keep two closed hands apart and level. Hold steady while we find your neutral position.</p>
-        <div class="calibration-ring"><span id="calibration-percent">0%</span></div>
+        <h2>${players > 1 ? 'BOTH HOLD THE WHEEL.' : 'HOLD THE WHEEL.'}</h2>
+        <p>${
+          players > 1
+            ? 'Sit side by side, each on your own half of the camera. Keep two closed hands apart and level, and hold steady while we find each neutral position.'
+            : 'Keep two closed hands apart and level. Hold steady while we find your neutral position.'
+        }</p>
+        <div class="calibration-rings">${rings}</div>
         <button id="cancel-camera" class="secondary-button">USE KEYBOARD INSTEAD</button>
       </div>`;
     byId('cancel-camera').addEventListener('click', () => void this.useKeyboard(), {
@@ -287,57 +415,121 @@ export class DrivingApplication {
     this.setTracking('LOADING HAND MODEL', 'warn');
     this.cameraHint.textContent = 'LOADING TRACKER';
 
-    this.handController?.stop();
+    this.stopHandControllers();
+    this.handStatuses = Array.from({ length: players }, () => 'loading');
+    this.handProgress = Array.from({ length: players }, () => 0);
     // MediaPipe is a large optional dependency; keyboard players never need to
     // download or parse it, so load the controller only after hand mode wins.
-    const { HandController } = await import('../controls/HandController');
-    this.handController = new HandController(
-      this.video,
-      this.cameraCanvas,
-      (status, progress = 0) => this.onHandStatus(status, progress),
-      (command) => this.onHandCommand(command),
-    );
+    const { HandController, openCamera } = await import('../controls/HandController');
+    const { FULL_FRAME, SPLIT_REGIONS } = await import('../controls/cameraRegion');
     try {
-      await this.handController.start();
-    } catch {
-      this.mode = 'keyboard';
+      if (players > 1) this.sharedStream = await openCamera(this.video, 'split');
+      this.handControllers = Array.from(
+        { length: players },
+        (_, index) =>
+          new HandController(
+            this.video,
+            this.cameraCanvases[index],
+            (status, progress = 0) => this.onHandStatus(index, status, progress),
+            (command) => this.onHandCommand(index, command),
+            players > 1 ? SPLIT_REGIONS[index] : FULL_FRAME,
+          ),
+      );
+      await Promise.all(this.handControllers.map((controller) => controller.start()));
+    } catch (error) {
+      console.warn('Hand tracking unavailable:', error);
+      if (this.mode === 'hands') this.onHandStatus(0, 'error', 0);
     }
   }
 
-  private onHandCommand(command: HandCommand): void {
-    if (command === 'cruise-toggle') this.game?.toggleCruise();
-    else this.game?.adjustCruise(command === 'cruise-faster' ? 1 : -1);
+  private stopHandControllers(): void {
+    this.handControllers.forEach((controller) => controller.stop());
+    this.handControllers = [];
+    this.sharedStream?.getTracks().forEach((track) => track.stop());
+    this.sharedStream = null;
+    this.video.srcObject = null;
+    for (const canvas of this.cameraCanvases) {
+      canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    }
   }
 
-  private onHandStatus(status: string, progress: number): void {
-    const percent = Math.min(100, Math.round(progress * 100));
-    document.getElementById('calibration-percent')?.replaceChildren(`${percent}%`);
-    document
-      .querySelector<HTMLElement>('.calibration-ring')
-      ?.style.setProperty('--progress', `${percent * 3.6}deg`);
+  private onHandCommand(playerIndex: number, command: HandCommand): void {
+    if (command === 'cruise-toggle') this.game?.toggleCruise(playerIndex);
+    else this.game?.adjustCruise(command === 'cruise-faster' ? 1 : -1, playerIndex);
+  }
 
+  private onHandStatus(playerIndex: number, status: string, progress: number): void {
+    if (this.mode !== 'hands') return;
+    this.handStatuses[playerIndex] = status;
+    this.handProgress[playerIndex] = progress;
+    const percent = Math.min(100, Math.round(progress * 100));
+    const ring = document.querySelector<HTMLElement>(
+      `.calibration-ring[data-player="${playerIndex}"]`,
+    );
     if (status === 'calibrating') {
-      this.setTracking('HOLD BOTH FISTS', 'warn');
-      this.cameraHint.textContent = progress > 0 ? 'HOLD STEADY' : 'SHOW TWO CLOSED HANDS';
+      ring?.querySelector('span')?.replaceChildren(`${percent}%`);
+      ring?.style.setProperty('--progress', `${percent * 3.6}deg`);
     } else if (status === 'tracking') {
+      ring?.querySelector('span')?.replaceChildren('OK');
+      ring?.style.setProperty('--progress', '360deg');
+    }
+
+    if (status === 'error') {
+      this.cameraShell!.classList.remove('is-calibrating');
+      this.cameraShell!.classList.add('is-offline');
+      this.setTracking('CAMERA UNAVAILABLE');
+      this.stopHandControllers();
+      this.mode = 'keyboard';
+      this.showKeyboardReady();
+      return;
+    }
+
+    const statuses = this.handStatuses;
+    const allTracking = statuses.every((current) => current === 'tracking');
+    if (allTracking) {
       this.cameraShell!.classList.remove('is-calibrating');
       this.setTracking('HANDS TRACKED', 'ok');
       this.cameraHint.textContent = 'STEERING ACTIVE';
       if (this.game?.getPhase() !== 'playing' && !document.getElementById('begin-run')) {
         this.showDriveReady(
           'CALIBRATION LOCKED.',
-          'Turn your hands like a wheel. Raise both thumbs to slow to 40 km/h, or show both open palms for a full stop; keep them open for a few seconds after the car stops to reverse (a countdown shows when). Hold a V sign with both hands for adaptive cruise, and raise just your right or left thumb to change its speed. Press H for the horn and Space for the handbrake.',
+          statuses.length > 1
+            ? 'Both wheels are locked. Each player turns their hands like a wheel on their own half of the camera. Raise both thumbs to slow to 40 km/h, or show both open palms for a full stop. A V sign with both hands toggles adaptive cruise. Player 1 holds Space for the handbrake, player 2 holds Right Shift. Last driver on the road wins.'
+            : 'Turn your hands like a wheel. Raise both thumbs to slow to 40 km/h, or show both open palms for a full stop; keep them open for a few seconds after the car stops to reverse (a countdown shows when). Hold a V sign with both hands for adaptive cruise, and raise just your right or left thumb to change its speed. Press H for the horn and Space for the handbrake.',
         );
       }
+      return;
+    }
+
+    const describe = (current: string, index: number): string =>
+      current === 'calibrating'
+        ? (this.handProgress[index] ?? 0) > 0
+          ? 'HOLD STEADY'
+          : 'SHOW TWO FISTS'
+        : current === 'lost'
+          ? 'SHOW TWO CLOSED HANDS'
+          : current === 'tracking'
+            ? 'OK'
+            : 'LOADING';
+    if (statuses.length > 1) {
+      const lost = statuses.some((current) => current === 'lost');
+      this.setTracking(
+        lost
+          ? 'HANDS LOST'
+          : statuses.includes('calibrating')
+            ? 'HOLD BOTH FISTS'
+            : 'LOADING HAND MODEL',
+        'warn',
+      );
+      this.cameraHint.textContent = statuses
+        .map((current, index) => `P${index + 1}: ${describe(current, index)}`)
+        .join(' · ');
+    } else if (status === 'calibrating') {
+      this.setTracking('HOLD BOTH FISTS', 'warn');
+      this.cameraHint.textContent = progress > 0 ? 'HOLD STEADY' : 'SHOW TWO CLOSED HANDS';
     } else if (status === 'lost') {
       this.setTracking('HANDS LOST', 'warn');
       this.cameraHint.textContent = 'SHOW TWO CLOSED HANDS';
-    } else if (status === 'error') {
-      this.cameraShell!.classList.remove('is-calibrating');
-      this.cameraShell!.classList.add('is-offline');
-      this.setTracking('CAMERA UNAVAILABLE');
-      this.mode = 'keyboard';
-      this.showKeyboardReady();
     }
   }
 
@@ -345,7 +537,7 @@ export class DrivingApplication {
     const button = document.getElementById('keyboard-start') as HTMLButtonElement | null;
     if (!(await this.prepareSelectedCars(button ?? undefined))) return;
     this.mode = 'keyboard';
-    this.handController?.stop();
+    this.stopHandControllers();
     this.cameraShell!.classList.remove('is-calibrating');
     this.cameraShell!.classList.add('is-offline', 'is-hidden');
     this.setTracking('KEYBOARD CONTROL', 'ok');
@@ -354,6 +546,13 @@ export class DrivingApplication {
   }
 
   private showKeyboardReady(): void {
+    if (this.players > 1) {
+      this.showDriveReady(
+        'KEYBOARDS READY.',
+        'Player 1 (left screen): W / S to accelerate and brake, A / D to steer, Space for the handbrake, C for adaptive cruise and − / + for its speed. Player 2 (right screen): the arrow keys, Right Shift for the handbrake, Right Ctrl or Numpad 0 for adaptive cruise and Numpad − / + for its speed. Keep braking at a stop to reverse. Last driver on the road wins.',
+      );
+      return;
+    }
     this.showDriveReady(
       'KEYBOARD READY.',
       'Use W or ↑ to accelerate, S or ↓ to brake, and A / D or ← / → to steer. Keep holding S at a stop to reverse. Hold Space for the handbrake and H for the horn. Press C or use the ACC panel for adaptive cruise; + and − set its speed.',
@@ -378,15 +577,86 @@ export class DrivingApplication {
     this.audio.start();
     this.audio.setPlaying(true);
     this.overlay.classList.add('is-hidden');
-    this.hud.show();
+    if (this.players > 1) this.splitHud.show(this.players);
+    else this.hud.show();
     this.game.start();
     this.pauseButton.textContent = 'PAUSE';
   }
 
+  /**
+   * The race is over: times, positions and any new lap record, with the
+   * track picker borrowed from the start screen so the next race can be on
+   * another circuit or over a different number of laps.
+   */
+  private showRaceResults(results: readonly GameSnapshot[]): void {
+    this.audio.setPlaying(false);
+    this.raceCountdown.update([]);
+    this.overlay.classList.remove('is-hidden');
+    const { trackId } = this.trackSettings.get();
+    const track = getTrack(trackId);
+    const fastest = Math.min(...results.map((result) => result.race?.bestLap ?? Infinity));
+    const newRecord = saveBestLap(trackId, Number.isFinite(fastest) ? fastest : null);
+    this.trackSettings.refreshRecords();
+    const record = newRecord ? '<div class="record-flag">NEW LAP RECORD</div>' : '';
+    let headline: string;
+    let summary: string;
+    if (results.length === 1) {
+      const race = results[0].race;
+      headline = 'CHEQUERED FLAG.';
+      summary = `
+        <div class="final-stats">
+          <div><span>TOTAL TIME</span><b>${formatLapTime(race?.totalTime ?? null)}</b></div>
+          <div><span>BEST LAP</span><b>${formatLapTime(race?.bestLap ?? null)}</b></div>
+          <div><span>LAPS</span><b>${race?.laps ?? 0}</b></div>
+        </div>`;
+    } else {
+      const ranked = results
+        .map((result, index) => ({ result, index }))
+        .sort((x, y) => (x.result.race?.position ?? 0) - (y.result.race?.position ?? 0));
+      const winner = ranked[0];
+      headline = winner.result.race?.finished
+        ? `PLAYER ${winner.index + 1} WINS.`
+        : 'NO FINISHERS.';
+      summary = `<div class="split-results">${ranked
+        .map(({ result, index }) => {
+          const race = result.race;
+          const position = race?.position ?? index + 1;
+          const time = race?.finished
+            ? formatLapTime(race.totalTime)
+            : `DNF · LAP ${race?.lap ?? 1}/${race?.laps ?? 1}`;
+          return `
+            <div class="split-result${race?.finished && position === 1 ? ' is-winner' : ''}">
+              <span>${position}${ordinalSuffix(position)} · PLAYER ${index + 1}</span>
+              <b>${time}</b>
+              <small>BEST LAP ${formatLapTime(race?.bestLap ?? null)}</small>
+            </div>`;
+        })
+        .join('')}</div>`;
+    }
+    this.overlay.innerHTML = `
+      <div class="modal results-modal">
+        <div class="eyebrow"><span></span> RACE COMPLETE · ${track.name.toUpperCase()}</div>
+        <h2>${headline}</h2>
+        ${record}
+        ${summary}
+        <div id="results-track-slot" class="results-track-slot"></div>
+        <button id="restart-run" class="primary-button"><span>RACE AGAIN</span><i>↻</i></button>
+      </div>`;
+    byId('results-track-slot').append(this.trackSettings.element);
+    byId('restart-run').addEventListener('click', () => this.beginRun(), {
+      signal: this.events.signal,
+    });
+  }
+
   private showCrash(): void {
     this.audio.setPlaying(false);
-    const snapshot = this.lastSnapshot;
     this.overlay.classList.remove('is-hidden');
+    const snapshots = this.lastSnapshots;
+    if (snapshots.length > 1) {
+      this.showSplitResults(snapshots);
+      return;
+    }
+    const snapshot = snapshots[0];
     this.overlay.innerHTML = `
       <div class="modal compact-modal crash-modal">
         <div class="eyebrow danger"><span></span> RUN ENDED</div>
@@ -397,6 +667,35 @@ export class DrivingApplication {
           <div><span>SCORE</span><b>${snapshot?.score ?? 0}</b></div>
         </div>
         <button id="restart-run" class="primary-button"><span>DRIVE AGAIN</span><i>↻</i></button>
+      </div>`;
+    byId('restart-run').addEventListener('click', () => this.beginRun(), {
+      signal: this.events.signal,
+    });
+  }
+
+  /** Both drivers have crashed: the higher score wins. */
+  private showSplitResults(snapshots: readonly GameSnapshot[]): void {
+    const best = Math.max(...snapshots.map((snapshot) => snapshot.score));
+    const winners = snapshots
+      .map((snapshot, index) => ({ snapshot, index }))
+      .filter(({ snapshot }) => snapshot.score === best);
+    const headline = winners.length > 1 ? 'DEAD HEAT.' : `PLAYER ${winners[0].index + 1} WINS.`;
+    const rows = snapshots
+      .map(
+        (snapshot, index) => `
+          <div class="split-result${snapshot.score === best ? ' is-winner' : ''}">
+            <span>PLAYER ${index + 1}</span>
+            <b>${snapshot.score}</b>
+            <small>${(snapshot.distance / 1000).toFixed(2)} KM · ${snapshot.overtakes} PASSED</small>
+          </div>`,
+      )
+      .join('');
+    this.overlay.innerHTML = `
+      <div class="modal compact-modal crash-modal">
+        <div class="eyebrow danger"><span></span> RACE OVER</div>
+        <h2>${headline}</h2><p>Both drivers are off the road. Distance and overtakes decide the score.</p>
+        <div class="split-results">${rows}</div>
+        <button id="restart-run" class="primary-button"><span>REMATCH</span><i>↻</i></button>
       </div>`;
     byId('restart-run').addEventListener('click', () => this.beginRun(), {
       signal: this.events.signal,
@@ -471,12 +770,35 @@ export class DrivingApplication {
     requestAnimationFrame(() => requestAnimationFrame(() => this.game?.refreshViewport()));
   }
 
+  /** Which player a handbrake key belongs to, or −1. One player uses Space alone. */
+  private handbrakePlayer(code: string): number {
+    const keys = this.players > 1 ? HANDBRAKE_KEYS : HANDBRAKE_KEYS.slice(0, 1);
+    return keys.findIndex((playerKeys) => playerKeys.includes(code));
+  }
+
+  /** Adaptive cruise keys: [player, action], or null. */
+  private cruiseKey(code: string): [number, 'toggle' | 1 | -1] | null {
+    if (code === 'KeyC') return [0, 'toggle'];
+    if (this.players > 1) {
+      if (code === 'Equal') return [0, 1];
+      if (code === 'Minus') return [0, -1];
+      if (code === 'ControlRight' || code === 'Numpad0') return [1, 'toggle'];
+      if (code === 'NumpadAdd') return [1, 1];
+      if (code === 'NumpadSubtract') return [1, -1];
+      return null;
+    }
+    if (code === 'Equal' || code === 'NumpadAdd') return [0, 1];
+    if (code === 'Minus' || code === 'NumpadSubtract') return [0, -1];
+    return null;
+  }
+
   private onGlobalKeyDown(event: KeyboardEvent): void {
-    if (event.code === 'Space') {
+    const handbrakePlayer = this.handbrakePlayer(event.code);
+    if (handbrakePlayer >= 0) {
       // The handbrake works in hand and keyboard modes alike, while driving.
       if (this.game?.getPhase() === 'playing') {
         event.preventDefault();
-        this.handbrakeHeld = true;
+        this.handbrakeHeld[handbrakePlayer] = true;
       }
       return;
     }
@@ -485,16 +807,14 @@ export class DrivingApplication {
       if (this.game?.getPhase() === 'playing') this.audio.setHorn(true);
       return;
     }
-    if (event.code === 'KeyC') {
-      if (!event.repeat) this.game?.toggleCruise();
-      return;
-    }
-    if (event.code === 'Equal' || event.code === 'NumpadAdd') {
-      this.game?.adjustCruise(1);
-      return;
-    }
-    if (event.code === 'Minus' || event.code === 'NumpadSubtract') {
-      this.game?.adjustCruise(-1);
+    const cruise = this.cruiseKey(event.code);
+    if (cruise) {
+      const [player, action] = cruise;
+      if (action === 'toggle') {
+        if (!event.repeat) this.game?.toggleCruise(player);
+      } else {
+        this.game?.adjustCruise(action, player);
+      }
       return;
     }
     if (event.code === 'Escape' && this.graphicsSettings.isOpen()) {

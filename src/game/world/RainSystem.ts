@@ -85,7 +85,7 @@ export class RainSystem {
   private readonly fallOffset = new THREE.Vector3();
   private hasLastCamera = false;
 
-  constructor(private readonly scene: THREE.Scene) {
+  constructor(private readonly scene: THREE.Object3D) {
     const material = new THREE.ShaderMaterial({
       name: 'DriftlineRain',
       uniforms: {

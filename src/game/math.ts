@@ -1,3 +1,6 @@
+import { DEFAULT_TRACK_ID, getTrack } from './tracks';
+import type { TrackDefinition, TrackId } from './tracks';
+
 export const clamp = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
 export const lerp = (from: number, to: number, amount: number): number =>
@@ -5,12 +8,20 @@ export const lerp = (from: number, to: number, amount: number): number =>
 export const damp = (from: number, to: number, lambda: number, dt: number): number =>
   lerp(from, to, 1 - Math.exp(-lambda * dt));
 
+let activeTrack: TrackDefinition = getTrack(DEFAULT_TRACK_ID);
+
+/** Chooses the road every system builds and drives on. */
+export function setActiveTrack(id: TrackId): void {
+  activeTrack = getTrack(id);
+}
+
+export function getActiveTrack(): TrackDefinition {
+  return activeTrack;
+}
+
+/** Sideways offset of the active road's centre line at `distance`. */
 export function roadCenter(distance: number): number {
-  return (
-    Math.sin(distance * 0.0065) * 17 +
-    Math.sin(distance * 0.014 + 1.8) * 7 +
-    Math.sin(distance * 0.0021 + 0.4) * 25
-  );
+  return activeTrack.center(distance);
 }
 
 export function roadHeading(distance: number): number {
